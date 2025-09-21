@@ -3,6 +3,8 @@ eventlet.monkey_patch()  # MUST be first
 
 import os
 import sqlite3
+import threading
+import time
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -14,12 +16,13 @@ print("[flask_app] module import starting...")
 
 # --------------------- CONFIG ---------------------
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
-JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "80"))  # 1..100
-STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.03"))  # seconds
+JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "70"))  # lower = smaller, faster
+STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.03"))
 DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "0.5"))
 
 # --------------------- SHARED STATE ---------------------
 latest_frames: Dict[str, Optional[np.ndarray]] = {"ped": None, "veh": None, "tl": None}
+latest_jpegs:  Dict[str, Optional[bytes]]     = {"ped": None, "veh": None, "tl": None}
 latest_status = {
     "ts": 0.0,
     "ped_count": 0,
@@ -31,8 +34,6 @@ latest_status = {
     "scenario": None,
 }
 
-# small lock for frame/status writes
-import threading
 _state_lock = threading.Lock()
 
 # --------------------- APP / SOCKET ---------------------
@@ -80,23 +81,16 @@ def decide_scenario(now_ts: float, ped_count: int, veh_count: int,
             action = "GO"
     return (action, "baseline")
 
-# --------------------- MJPEG STREAMING ---------------------
+# --------------------- MJPEG STREAMING (uses cached JPEGs) ---------------------
 def mjpeg_stream(key: str):
     boundary = b"--frame"
-    header = b"Content-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n"
+    header   = b"Content-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n"
     while True:
         with _state_lock:
-            frame = latest_frames.get(key)
-        if frame is None:
-            socketio.sleep(0.05)
+            jpg = latest_jpegs.get(key)
+        if jpg is None:
+            socketio.sleep(0.03)
             continue
-
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        if not ok:
-            socketio.sleep(0.02)
-            continue
-
-        jpg = buf.tobytes()
         yield boundary + b"\r\n" + header + jpg + b"\r\n"
         socketio.sleep(STREAM_INTERVAL_S)
 
@@ -219,8 +213,11 @@ def tail_db_emit():
 
 # --------------------- HOOKS (called by app.py) ---------------------
 def publish_frame(cam_key: str, frame: np.ndarray):
+    # cache raw frame (optional) + a single JPEG encode shared by all clients
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     with _state_lock:
         latest_frames[cam_key] = frame
+        latest_jpegs[cam_key]  = buf.tobytes() if ok else None
 
 def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
                              tl_color: str, nearest_m: float, avg_mps: float,
@@ -244,7 +241,10 @@ def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
     socketio.emit("status", latest_status, namespace="/realtime")
 
 # --------------------- MAIN ---------------------
-if __name__ == "__main__":
-    print("[flask_app] Starting Flask-SocketIO on http://0.0.0.0:5000 ...")
+def start_http_server(host="0.0.0.0", port=5000):
+    print(f"[flask_app] Starting Flask-SocketIO on http://{host}:{port} ...")
     socketio.start_background_task(tail_db_emit)  # optional
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
+    socketio.run(app, host=host, port=port, debug=False)
+
+if __name__ == "__main__":
+    start_http_server()
