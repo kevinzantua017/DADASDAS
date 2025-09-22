@@ -3,9 +3,8 @@ eventlet.monkey_patch()  # MUST be first
 
 import os
 import sqlite3
-import threading
-import time
 from typing import Dict, Optional, Tuple
+import threading
 
 import cv2
 import numpy as np
@@ -16,13 +15,12 @@ print("[flask_app] module import starting...")
 
 # --------------------- CONFIG ---------------------
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
-JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "70"))  # lower = smaller, faster
-STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.03"))
-DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "0.5"))
+JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "80"))  # 1..100
+STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.03"))  # seconds
+DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "30.0"))  # <- 30s emits
 
 # --------------------- SHARED STATE ---------------------
 latest_frames: Dict[str, Optional[np.ndarray]] = {"ped": None, "veh": None, "tl": None}
-latest_jpegs:  Dict[str, Optional[bytes]]     = {"ped": None, "veh": None, "tl": None}
 latest_status = {
     "ts": 0.0,
     "ped_count": 0,
@@ -81,21 +79,29 @@ def decide_scenario(now_ts: float, ped_count: int, veh_count: int,
             action = "GO"
     return (action, "baseline")
 
-# --------------------- MJPEG STREAMING (uses cached JPEGs) ---------------------
+# --------------------- MJPEG STREAMING ---------------------
 def mjpeg_stream(key: str):
     boundary = b"--frame"
-    header   = b"Content-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n"
+    header = b"Content-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n"
     while True:
         with _state_lock:
-            jpg = latest_jpegs.get(key)
-        if jpg is None:
-            socketio.sleep(0.03)
+            frame = latest_frames.get(key)
+        if frame is None:
+            socketio.sleep(0.05)
             continue
+
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        if not ok:
+            socketio.sleep(0.02)
+            continue
+
+        jpg = buf.tobytes()
         yield boundary + b"\r\n" + header + jpg + b"\r\n"
         socketio.sleep(STREAM_INTERVAL_S)
 
 @app.get("/stream/<cam>")
 def stream_cam(cam: str):
+    print(f"[flask_app] stream request for: {cam}")
     if cam not in ("ped", "veh", "tl"):
         return "unknown cam", 404
     return Response(mjpeg_stream(cam), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -178,7 +184,7 @@ def api_analytics():
         for (m, p, v, go, st, off) in rows
     ])
 
-# --------------------- realtime emits ---------------------
+# --------------------- realtime emits (throttled to 30s) ---------------------
 def tail_db_emit():
     print("[flask_app] DB tailer started")
     last_id = 0
@@ -209,15 +215,12 @@ def tail_db_emit():
                     socketio.emit("log_insert", payload, namespace="/realtime")
         except Exception as e:
             print("[flask_app] tailer error:", repr(e))
-        socketio.sleep(DB_TAIL_INTERVAL_S)
+        socketio.sleep(DB_TAIL_INTERVAL_S)  # 30s
 
 # --------------------- HOOKS (called by app.py) ---------------------
 def publish_frame(cam_key: str, frame: np.ndarray):
-    # cache raw frame (optional) + a single JPEG encode shared by all clients
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     with _state_lock:
         latest_frames[cam_key] = frame
-        latest_jpegs[cam_key]  = buf.tobytes() if ok else None
 
 def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
                              tl_color: str, nearest_m: float, avg_mps: float,
@@ -240,10 +243,10 @@ def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
         })
     socketio.emit("status", latest_status, namespace="/realtime")
 
-# --------------------- MAIN ---------------------
+# --------------------- STARTER ---------------------
 def start_http_server(host="0.0.0.0", port=5000):
     print(f"[flask_app] Starting Flask-SocketIO on http://{host}:{port} ...")
-    socketio.start_background_task(tail_db_emit)  # optional
+    socketio.start_background_task(tail_db_emit)
     socketio.run(app, host=host, port=port, debug=False)
 
 if __name__ == "__main__":
