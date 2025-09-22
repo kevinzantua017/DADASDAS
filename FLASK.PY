@@ -4,7 +4,6 @@ eventlet.monkey_patch()  # MUST be first
 import os
 import sqlite3
 from typing import Dict, Optional, Tuple
-import threading
 
 import cv2
 import numpy as np
@@ -16,8 +15,26 @@ print("[flask_app] module import starting...")
 # --------------------- CONFIG ---------------------
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
 JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "80"))  # 1..100
-STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.03"))  # seconds
-DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "30.0"))  # <- 30s emits
+
+# Cap the browser stream at ~12fps (0.083s). This is what removes “30fps lag”.
+STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.083"))
+
+# Tail/emit logs every 30s
+DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "30.0"))
+
+# Optional: TurboJPEG for faster encoding if available
+try:
+    from turbojpeg import TurboJPEG
+    _jpeg = TurboJPEG()
+    def _encode_jpeg(img_bgr, quality):
+        return _jpeg.encode(img_bgr, quality=quality)
+    print("[flask_app] TurboJPEG active")
+except Exception:
+    _jpeg = None
+    def _encode_jpeg(img_bgr, quality):
+        ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return buf.tobytes() if ok else None
+    print("[flask_app] TurboJPEG not available; using OpenCV JPEG")
 
 # --------------------- SHARED STATE ---------------------
 latest_frames: Dict[str, Optional[np.ndarray]] = {"ped": None, "veh": None, "tl": None}
@@ -32,6 +49,8 @@ latest_status = {
     "scenario": None,
 }
 
+# small lock for frame/status writes
+import threading
 _state_lock = threading.Lock()
 
 # --------------------- APP / SOCKET ---------------------
@@ -87,21 +106,19 @@ def mjpeg_stream(key: str):
         with _state_lock:
             frame = latest_frames.get(key)
         if frame is None:
-            socketio.sleep(0.05)
-            continue
-
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        if not ok:
             socketio.sleep(0.02)
             continue
 
-        jpg = buf.tobytes()
+        jpg = _encode_jpeg(frame, JPEG_QUALITY)
+        if not jpg:
+            socketio.sleep(0.01)
+            continue
+
         yield boundary + b"\r\n" + header + jpg + b"\r\n"
-        socketio.sleep(STREAM_INTERVAL_S)
+        socketio.sleep(STREAM_INTERVAL_S)  # ~12 fps to browser
 
 @app.get("/stream/<cam>")
 def stream_cam(cam: str):
-    print(f"[flask_app] stream request for: {cam}")
     if cam not in ("ped", "veh", "tl"):
         return "unknown cam", 404
     return Response(mjpeg_stream(cam), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -184,7 +201,7 @@ def api_analytics():
         for (m, p, v, go, st, off) in rows
     ])
 
-# --------------------- realtime emits (throttled to 30s) ---------------------
+# --------------------- realtime emits ---------------------
 def tail_db_emit():
     print("[flask_app] DB tailer started")
     last_id = 0
@@ -215,7 +232,7 @@ def tail_db_emit():
                     socketio.emit("log_insert", payload, namespace="/realtime")
         except Exception as e:
             print("[flask_app] tailer error:", repr(e))
-        socketio.sleep(DB_TAIL_INTERVAL_S)  # 30s
+        socketio.sleep(DB_TAIL_INTERVAL_S)
 
 # --------------------- HOOKS (called by app.py) ---------------------
 def publish_frame(cam_key: str, frame: np.ndarray):
@@ -243,11 +260,8 @@ def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
         })
     socketio.emit("status", latest_status, namespace="/realtime")
 
-# --------------------- STARTER ---------------------
+# --------------------- Server entry callable ---------------------
 def start_http_server(host="0.0.0.0", port=5000):
     print(f"[flask_app] Starting Flask-SocketIO on http://{host}:{port} ...")
-    socketio.start_background_task(tail_db_emit)
+    socketio.start_background_task(tail_db_emit)  # DB tailer
     socketio.run(app, host=host, port=port, debug=False)
-
-if __name__ == "__main__":
-    start_http_server()
