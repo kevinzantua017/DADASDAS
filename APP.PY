@@ -14,13 +14,13 @@ from ultralytics import YOLO
 # Web hooks (from flask_app.py)
 from flask_app import publish_frame, publish_status_from_loop, start_http_server
 
-# ---- start Flask-SocketIO HTTP server in a background thread ----
+# ---- start HTTP server in background so you NEVER need to press Ctrl-C ----
 threading.Thread(
     target=start_http_server,
     kwargs={"host": "0.0.0.0", "port": 5000},
     daemon=True
 ).start()
-time.sleep(0.5)  # tiny grace period
+time.sleep(0.5)  # tiny grace so routes are live before first publish_frame
 
 # --------------------- FLAGS ---------------------
 SHOW_WINDOWS = False  # keep False on headless
@@ -45,9 +45,15 @@ VEHICLE_CLASSES = {"car", "truck", "bus", "motorbike", "bicycle"}
 # Frames (lighter for 3 cams)
 FRAME_W = int(os.getenv("SC_FRAME_W", "640"))
 FRAME_H = int(os.getenv("SC_FRAME_H", "360"))
+
+# Smooth, stable FPS for 3 cams on Pi
 FPS_TARGET = int(os.getenv("SC_FPS", "12"))
 FRAME_TIME = 1.0 / max(1, FPS_TARGET)
 SKIP_FRAMES = int(os.getenv("SC_SKIP", "1"))
+
+# 30s logging cadence (also smooths UI)
+LOG_INTERVAL_S = float(os.getenv("SC_LOG_INTERVAL_S", "30"))
+LOG_EVERY_N_FRAMES = max(1, int(LOG_INTERVAL_S * FPS_TARGET))
 
 # LED matrix (guarded init below)
 LED_CASCADE = int(os.getenv("SC_LED_CASCADE", "4"))
@@ -61,13 +67,13 @@ SPEED_AVG_WINDOW = 5
 # Pedestrian lane reference (in the vehicle camera frame)
 PEDESTRIAN_LANE_Y = int(os.getenv("SC_LANE_Y", "250"))  # <-- CALIBRATE
 
-# Safety threshold (meters) where vehicles are considered close to crosswalk
+# Safety threshold (meters)
 VEHICLE_CLOSE_THRESH_M = float(os.getenv("SC_VEH_CLOSE_M", "6.0"))
 
-# Traffic light ROI (x, y, w, h) in TL camera frame
+# Traffic light ROI (x, y, w, h)
 TRAFFIC_LIGHT_ROI = tuple(map(int, os.getenv("SC_TL_ROI", "100,60,120,160").split(",")))
 
-# HSV thresholds for colors
+# HSV thresholds
 HSV_RED_1 = ((0, 120, 120), (10, 255, 255))
 HSV_RED_2 = ((170, 120, 120), (180, 255, 255))
 HSV_YELLOW = ((15, 120, 120), (35, 255, 255))
@@ -75,7 +81,6 @@ HSV_GREEN  = ((40, 70, 70), (90, 255, 255))
 
 # Logging / DB
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
-LOG_EVERY_N_FRAMES = int(os.getenv("SC_LOG_EVERY", "5"))
 
 # Drawing
 COLOR_GREEN  = (0, 255, 0)
@@ -105,16 +110,21 @@ def _init_led():
     except Exception as e:
         if PRINT_DEBUG:
             print("[LED] Not available, falling back to console:", repr(e))
-
         def show_led(msg: str):
-            # no hardware: just print occasionally
             print("[LED]", msg)
         return show_led
 
 show_led = _init_led()
 
-# --------------------- CAMERA THREAD ---------------------
+# --------------------- CAMERA THREAD (low-latency) ---------------------
 class CameraStream:
+    """
+    Smooth, low-latency video capture:
+    - forces MJPG
+    - buffersize=1 to avoid queue buildup
+    - grab()/retrieve() pattern to drop old frames
+    - always exposes latest frame
+    """
     def __init__(self, index: int, width: int, height: int, fps: int):
         self.index = index
         self.width = width
@@ -135,9 +145,11 @@ class CameraStream:
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open camera index {self.index}")
 
+        # negotiate a fast MJPG mode, small buffers
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.cap.set(cv2.CAP_PROP_FPS,          min(self.fps, 12))
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
         def set_fourcc(code):
             fourcc = cv2.VideoWriter_fourcc(*code)
@@ -147,8 +159,8 @@ class CameraStream:
         if not set_fourcc('MJPG'):
             set_fourcc('YUYV') or set_fourcc('YUY2')
 
-        # Warm-up
-        self.cap.read()
+        # warm-up
+        self.cap.grab(); _ = self.cap.retrieve()
 
         # Log negotiated mode
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -159,29 +171,37 @@ class CameraStream:
         print(f"[OPEN] /dev/video{self.index} -> {w}x{h}@{f:.1f} FOURCC={fourcc_str}")
 
     def _reopen_once(self):
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+        try: self.cap.release()
+        except Exception: pass
         time.sleep(0.2)
         self._open_camera()
 
     def _update(self):
         no_frame = 0
         while not self.stopped:
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
+            # drop any backlog quickly
+            if not self.cap.grab():
                 no_frame += 1
-                if no_frame == 20:  # ~1–2s of misses -> reopen
+                if no_frame == 20:
                     print(f"[INFO] Reopening /dev/video{self.index} due to stalled frames…")
                     self._reopen_once()
                     no_frame = 0
-                time.sleep(0.02)
+                time.sleep(0.01)
+                continue
+            ret, frame = self.cap.retrieve()
+            if not ret or frame is None:
+                no_frame += 1
+                if no_frame == 20:
+                    print(f"[INFO] Reopening /dev/video{self.index} (retrieve fail)…")
+                    self._reopen_once()
+                    no_frame = 0
+                time.sleep(0.005)
                 continue
             else:
                 no_frame = 0
+
             with self.lock:
-                self.ret = ret
+                self.ret = True
                 self.frame = frame
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
@@ -190,14 +210,10 @@ class CameraStream:
 
     def stop(self):
         self.stopped = True
-        try:
-            self.thread.join(timeout=1.0)
-        except Exception:
-            pass
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+        try: self.thread.join(timeout=1.0)
+        except Exception: pass
+        try: self.cap.release()
+        except Exception: pass
 
 # --------------------- SIMPLE TRACKER ---------------------
 @dataclass
@@ -349,10 +365,6 @@ def detect_traffic_light_color(frame: np.ndarray) -> str:
     return best
 
 def safe_camera(index: int) -> Optional[int]:
-    """
-    Returns the index if it opens & reads 1 frame, else None.
-    Forces MJPG @ modest size/FPS to avoid blocking.
-    """
     try:
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         if not cap.isOpened():
@@ -376,10 +388,10 @@ i_ped = int(os.getenv("SC_CAM_PED", "0"))
 i_veh = int(os.getenv("SC_CAM_VEH", "2"))
 i_tl  = int(os.getenv("SC_CAM_TL",  "4"))
 
-# Smooth, load-friendly settings per stream
-cam_ped = CameraStream(i_ped, 640, 360, 12)   # pedestrians: 640x360 @ ~12 fps
-cam_veh = CameraStream(i_veh, 640, 360, 12)   # vehicles:   640x360 @ ~12 fps
-cam_tl  = CameraStream(i_tl,  480, 270,  8)   # traffic light: smaller @ ~8 fps
+# smooth, friendly settings per cam
+cam_ped = CameraStream(i_ped, 640, 360, 12)
+cam_veh = CameraStream(i_veh, 640, 360, 12)
+cam_tl  = CameraStream(i_tl,  480, 270,  8)
 
 print(f"[Pedestrian Cam] /dev/video{i_ped}")
 print(f"[Vehicle Cam]    /dev/video{i_veh}")
@@ -403,10 +415,6 @@ veh_tracker = CentroidTracker(max_dist_px=120.0, max_age_s=1.0)
 frame_idx = 0
 last_log = 0
 
-# cache last counts so they don't drop to 0 when skipping inference
-last_ped_count = 0
-last_veh_count = 0
-
 try:
     while True:
         loop_start = time.time()
@@ -417,11 +425,11 @@ try:
         rv, fv = cam_veh.read()
         rt, ft = cam_tl.read()
         if not (rp and rv and rt) or fp is None or fv is None or ft is None:
-            print("[WARN] One or more cameras not providing frames.")
-            time.sleep(0.1)
+            # keep loop light if any camera temporarily stalls
+            time.sleep(0.02)
             continue
 
-        # Resize to UI size (keeps UI consistent regardless of negotiated capture size)
+        # Resize to UI size
         fp_s = cv2.resize(fp, (FRAME_W, FRAME_H))
         fv_s = cv2.resize(fv, (FRAME_W, FRAME_H))
         ft_s = cv2.resize(ft, (FRAME_W, FRAME_H))
@@ -429,17 +437,14 @@ try:
         do_infer = (frame_idx % SKIP_FRAMES == 0)
 
         # --- Pedestrians ---
+        ped_count = 0
         if do_infer:
             det_p = yolo_detect(fp_s, YOLO_CONF, YOLO_IMG_SZ)
             det_p = filter_classes(det_p, PEDESTRIAN_CLASSES)
             ped_count = len(det_p)
-            last_ped_count = ped_count  # cache latest good value
             for lab, (x1,y1,x2,y2), cf in det_p:
                 cv2.rectangle(fp_s, (x1,y1), (x2,y2), COLOR_GREEN, 2)
                 cv2.putText(fp_s, f"{lab} {cf:.2f}", (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_GREEN, 1)
-        else:
-            ped_count = last_ped_count  # reuse when skipping inference
-
         cv2.putText(fp_s, f"Pedestrians: {ped_count}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
 
         # --- Vehicles (detect + track + speed + distance to crosswalk line) ---
@@ -452,8 +457,6 @@ try:
             det_v = yolo_detect(fv_s, YOLO_CONF, YOLO_IMG_SZ)
             det_v = filter_classes(det_v, VEHICLE_CLASSES)
             veh_count = len(det_v)
-            last_veh_count = veh_count  # cache
-
             now = time.time()
             det_v_in = [(lab, bbox) for lab, bbox, _ in det_v]
             veh_tracker.update(det_v_in, now)
@@ -466,7 +469,7 @@ try:
             # distance to pedestrian lane
             for _, (x1,y1,x2,y2) in det_v_in:
                 cx = (x1 + x2) // 2
-                cy = y2  # bottom of box as vehicle front proxy
+                cy = y2  # vehicle front proxy
                 dy_px = max(0, PEDESTRIAN_LANE_Y - cy)
                 dist_m = abs(dy_px) / PIXELS_PER_METER_VEH
                 nearest_vehicle_distance_m = min(nearest_vehicle_distance_m, dist_m)
@@ -480,14 +483,11 @@ try:
             # draw track ids + speed
             speeds = veh_tracker.speeds_mps(PIXELS_PER_METER_VEH)
             for tid, tr in veh_tracker.tracks.items():
-                if not tr.history:
-                    continue
+                if not tr.history: continue
                 _, cx, cy = tr.history[-1]
                 s = speeds.get(tid, 0.0)
                 cv2.circle(fv_s, (cx, cy), 3, COLOR_BLUE, -1)
                 cv2.putText(fv_s, f"ID {tid} {s:.1f} m/s", (cx+6, cy-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_BLUE, 1)
-        else:
-            veh_count = last_veh_count  # reuse when skipping inference
 
         cv2.putText(fv_s, f"Vehicles: {veh_count}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
         cv2.line(fv_s, (0, PEDESTRIAN_LANE_Y), (FRAME_W, PEDESTRIAN_LANE_Y), COLOR_YELLOW, 2)
@@ -504,14 +504,14 @@ try:
         publish_frame("tl",  ft_s)
 
         # Prepare status → website (Socket.IO + REST mirror)
-        now = time.time()
-        local_hour = time.localtime(now).tm_hour
+        now_ts = time.time()
+        local_hour = time.localtime(now_ts).tm_hour
         flags = {"night": local_hour >= 21, "rush": local_hour == 7}
         extra = {"ambulance": False}
 
         nearest_m = 0.0 if nearest_vehicle_distance_m == float('inf') else nearest_vehicle_distance_m
         publish_status_from_loop(
-            now_ts=now,
+            now_ts=now_ts,
             ped_count=ped_count,
             veh_count=veh_count,
             tl_color=tl_color,
@@ -536,7 +536,7 @@ try:
                 action = "OFF"
         elif tl_color == "yellow":
             action = "STOP" if ped_count > 0 else "OFF"
-        else:  # unknown
+        else:
             if ped_count > 0 and (veh_close or veh_count > 0):
                 action = "STOP"
             elif ped_count > 0:
@@ -546,7 +546,7 @@ try:
 
         show_led(action)
 
-        # --- Overlays ---
+        # overlays
         cv2.putText(
             fv_s,
             f"Nearest dist: {nearest_m:.1f} m",
@@ -554,7 +554,7 @@ try:
         )
         cv2.putText(fv_s, f"Avg speed: {avg_speed_mps:.1f} m/s", (8, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
 
-        # --- Logging ---
+        # --- Logging every ~30s ---
         if frame_idx - last_log >= LOG_EVERY_N_FRAMES:
             ts = time.time()
             log_event(DB_PATH, ts, int(ped_count), int(veh_count), tl_color, float(nearest_m), float(avg_speed_mps), action)
@@ -564,8 +564,7 @@ try:
             cv2.imshow("Pedestrians", fp_s)
             cv2.imshow("Vehicles", fv_s)
             cv2.imshow("Traffic Light", ft_s)
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
+            if (cv2.waitKey(1) & 0xFF) == 27:
                 break
 
         # pacing
