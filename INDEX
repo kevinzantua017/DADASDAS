@@ -40,7 +40,8 @@
 
     <!-- Dashboard -->
     <section id="dashboard" class="container active">
-      <h2>📡 Live Monitoring for Adamson University San Marcelino ST.</h2>
+      <h2>📡 Live Monitoring — Adamson University San Marcelino St.</h2>
+
       <div class="grid-dashboard">
         <div class="card">
           <h3>Pedestrian Camera</h3>
@@ -64,38 +65,47 @@
         </div>
       </div>
 
-      <div class="status">
-        <p><strong>System Status:</strong> OFFLINE</p>
-        <p><strong>Current Decision:</strong> OFFLINE</p>
+      <div class="status-row">
+        <div class="card status">
+          <h3>System Status</h3>
+          <p><strong>Status:</strong> <span id="sysStatus" class="badge offline">OFFLINE</span></p>
+          <p id="sysDetail">TL: — | 🚶 0 | 🚗 0 | Nearest: 0.0 m | Speed: 0.0 m/s (0 km/h)</p>
+        </div>
+
+        <div class="card status">
+          <h3>Traffic Light & Next Action</h3>
+          <p>Current Light: <span id="tlLight" class="light">—</span></p>
+          <p>Next Action (live): <strong><span id="scenarioMessage">—</span></strong></p>
+        </div>
       </div>
     </section>
 
     <!-- Analytics -->
     <section id="analytics" class="container">
-      <h2>📊 Analytics</h2>
+      <h2>📊 Analytics (Hourly)</h2>
       <div class="grid-2">
         <div class="card" style="height:360px;">
-          <h3>Vehicle & Pedestrian Density (last hour)</h3>
+          <h3>Vehicle & Pedestrian Density (hourly)</h3>
           <canvas id="densityChart"></canvas>
         </div>
-        <div class="card">
-          <h3>Traffic Light Color</h3>
-          <p>Current Light: <span class="light">—</span></p>
-          <p>Next Action (live): <strong><span id="scenarioMessage">—</span></strong></p>
+        <div class="card" style="height:360px;">
+          <h3>Decision Breakdown (GO/STOP/OFF per hour)</h3>
+          <canvas id="decisionChart"></canvas>
         </div>
       </div>
 
       <div class="grid-2">
-        <div class="card" style="height:360px;">
-          <h3>Decision Breakdown (GO/STOP/OFF)</h3>
-          <canvas id="decisionChart"></canvas>
+        <div class="card">
+          <h3>Average Waiting Times (hourly)</h3>
+          <ul>
+            <li>🚶 Pedestrians (avg STOP duration/event): <strong id="avgWaitPed">—</strong></li>
+            <li>🚗 Vehicles (avg GO duration/event): <strong id="avgWaitVeh">—</strong></li>
+          </ul>
+          <small>Note: waiting time is approximated from consecutive action durations in logs sampled every 30s.</small>
         </div>
         <div class="card">
-          <h3>Average Waiting Times</h3>
-          <ul>
-            <li>🚶 Pedestrians: <strong id="avgWaitPed">—</strong></li>
-            <li>🚗 Vehicles: <strong id="avgWaitVeh">—</strong></li>
-          </ul>
+          <h3>Latest Hour Summary</h3>
+          <p id="latestHourSummary">—</p>
         </div>
       </div>
     </section>
@@ -123,7 +133,7 @@
           <li><strong>Traffic Light:</strong> Red</li>
         </ul>
         <p><strong>YOLOv8 Action:</strong> System delays pedestrian crossing to ease vehicle congestion.<br>
-          LED: <em>“Vehicles Priority – Wait to Cross”</em></p>
+          LED: <em>“Vehicles Priority — Wait to Cross”</em></p>
       </div>
 
       <div class="card scenario-card">
@@ -138,12 +148,12 @@
           </div>
         </div>
         <ul>
-          <li><strong>Pedestrian Camera:</strong> 30+ Civilians waiting</li>
+          <li><strong>Pedestrian Camera:</strong> 30+ civilians waiting</li>
           <li><strong>Vehicle Camera:</strong> 0–5 Vehicles</li>
           <li><strong>Traffic Light:</strong> Green</li>
         </ul>
         <p><strong>YOLOv8 Action:</strong> Prioritize pedestrians (high density, low vehicles).<br>
-          LED: <em>“Prepare to Stop – Pedestrians Crossing”</em>, then <em>“Safe to Cross”</em> on red.</p>
+          LED: <em>“Prepare to Stop — Pedestrians Crossing”</em>, then <em>“Safe to Cross”</em> on red.</p>
       </div>
 
       <div class="card scenario-card">
@@ -163,7 +173,7 @@
           <li><strong>Traffic Light:</strong> Yellow → Red</li>
         </ul>
         <p><strong>YOLOv8 Action:</strong> Override for ambulance right-of-way.<br>
-          LED: <em>“Emergency Vehicle Passing – Please Wait”</em> → Safe to Cross</p>
+          LED: <em>“Emergency Vehicle Passing — Please Wait”</em> → Safe to Cross</p>
       </div>
     </section>
 
@@ -188,6 +198,7 @@
     <footer>
       <p>© 2025 Adamson University | AI-Driven LED Board Optimization</p>
     </footer>
+
   </div> <!-- /dashboardPage -->
 
 </div> <!-- /page-wrapper -->
@@ -197,7 +208,11 @@
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
   // ========= CONFIG =========
-  const BASE_URL = "http://172.20.10.3:5000";   // Flask on the Pi
+  const BASE_URL = "http://192.168.137.214:5000";   // Flask on the Pi
+  const USE_REALTIME_LOGS = false;                  // we poll for Archive table
+
+  let densityChart, decisionChart, chartsLoaded = false;
+  let logsTimer = null;                             // 30s polling timer for Archive
 
   // ========= LOGIN =========
   function doLogin(){
@@ -237,11 +252,6 @@
   });
 
   // ========= TABS =========
-  // Added logsTimer + USE_REALTIME_LOGS for 30s Archive refresh
-  let densityChart, decisionChart, chartsLoaded = false;
-  let logsTimer = null;                 // 30s polling timer for Archive
-  const USE_REALTIME_LOGS = false;      // disable socket-push for Archive table
-
   function openTab(tabId) {
     document.querySelectorAll('.container').forEach(s => s.classList.remove('active'));
     const el = document.getElementById(tabId);
@@ -284,38 +294,39 @@
   function scenarioBanner(s) {
     const base = s.action === "GO" ? "Safe to Cross" : (s.action === "STOP" ? "Stop" : "Standby");
     const map = {
-      scenario_1_night_ped: "Prepare to Stop – Pedestrians Crossing",
-      scenario_2_rush_hold: "Vehicles Priority – Wait to Cross",
-      scenario_3_emergency: "Emergency Vehicle Passing – Please Wait",
+      scenario_1_night_ped: "Prepare to Stop — Pedestrians Crossing",
+      scenario_2_rush_hold: "Vehicles Priority — Wait to Cross",
+      scenario_3_emergency: "Emergency Vehicle Passing — Please Wait",
       baseline: base
     };
     return map[s.scenario || "baseline"];
   }
 
   socket.on("status", (s) => {
-    // Status strip
-    const st = document.querySelector(".status");
-    if (st) {
-      st.innerHTML = `
-        <p><strong>System Status:</strong> ONLINE</p>
-        <p><strong>Current Decision:</strong> ${s.action} ${s.scenario ? "(" + s.scenario + ")" : ""}</p>
-        <p><strong>TL:</strong> ${(s.tl_color||'').toUpperCase()} | 🚶 ${s.ped_count} | 🚗 ${s.veh_count}
-           | Nearest: ${Number(s.nearest_vehicle_distance_m).toFixed(1)} m
-           | Speed: ${Number(s.avg_vehicle_speed_mps).toFixed(1)} m/s (${(Number(s.avg_vehicle_speed_mps)*3.6).toFixed(0)} km/h)
-        </p>`;
+    // System status card
+    const sysStatus = document.getElementById("sysStatus");
+    const sysDetail = document.getElementById("sysDetail");
+    if (sysStatus) {
+      sysStatus.textContent = s.online ? "ONLINE" : "OFFLINE";
+      sysStatus.classList.toggle("online", !!s.online);
+      sysStatus.classList.toggle("offline", !s.online);
+    }
+    if (sysDetail) {
+      sysDetail.textContent =
+        `TL: ${(s.tl_color||'').toUpperCase()} | 🚶 ${s.ped_count} | 🚗 ${s.veh_count} | ` +
+        `Nearest: ${Number(s.nearest_vehicle_distance_m).toFixed(1)} m | ` +
+        `Speed: ${Number(s.avg_vehicle_speed_mps).toFixed(1)} m/s (${(Number(s.avg_vehicle_speed_mps)*3.6).toFixed(0)} km/h)`;
     }
 
-    // Light color label
-    const lightSpan = document.querySelector('#analytics .light');
+    // Light color label and scenario banners
+    const lightSpan = document.getElementById('tlLight');
     if (lightSpan) {
       lightSpan.className = 'light ' + (s.tl_color || '');
       lightSpan.textContent = (s.tl_color||'').toUpperCase();
     }
-
-    // Scenario banners
-    const text = scenarioBanner(s);
     const msg1 = document.getElementById("scenarioMessage");
     const msg2 = document.getElementById("scenarioMessage2");
+    const text = scenarioBanner(s);
     if (msg1) msg1.textContent = text;
     if (msg2) msg2.textContent = text;
 
@@ -332,7 +343,6 @@
     document.getElementById("status3")?.classList.toggle("offline", s.scenario !== "scenario_3_emergency");
   });
 
-  // Gate realtime log pushes for the Archive table (we poll every 30s instead)
   if (USE_REALTIME_LOGS) {
     socket.on("log_insert", (row) => {
       const tbody = document.querySelector("#logs tbody");
@@ -355,7 +365,7 @@
       const res = await fetch(BASE_URL + "/api/analytics");
       const rows = await res.json();
 
-      const labels = rows.map(r => r.minute);
+      const labels = rows.map(r => r.hour);
       const ped = rows.map(r => r.avg_ped);
       const veh = rows.map(r => r.avg_veh);
       const go  = rows.map(r => r.go);
@@ -366,8 +376,8 @@
         type: 'bar',
         data: { labels,
           datasets: [
-            { label: 'Avg Pedestrians', data: ped },
-            { label: 'Avg Vehicles', data: veh },
+            { label: 'Avg Pedestrians / hr', data: ped },
+            { label: 'Avg Vehicles / hr', data: veh },
           ]
         },
         options: { responsive: true, maintainAspectRatio: false }
@@ -377,13 +387,25 @@
         type: 'line',
         data: { labels,
           datasets: [
-            { label: 'GO', data: go },
-            { label: 'STOP', data: stop },
-            { label: 'OFF', data: off },
+            { label: 'GO (count/hr)', data: go },
+            { label: 'STOP (count/hr)', data: stop },
+            { label: 'OFF (count/hr)', data: off },
           ]
         },
         options: { responsive: true, maintainAspectRatio: false }
       });
+
+      // Average waiting times — display latest hour values if present
+      if (rows.length) {
+        const last = rows[rows.length - 1];
+        document.getElementById('avgWaitPed').textContent =
+          isFinite(last.avg_wait_ped_s) ? `${last.avg_wait_ped_s.toFixed(0)} s` : '—';
+        document.getElementById('avgWaitVeh').textContent =
+          isFinite(last.avg_wait_veh_s) ? `${last.avg_wait_veh_s.toFixed(0)} s` : '—';
+        document.getElementById('latestHourSummary').textContent =
+          `${last.hour}: Ped=${last.avg_ped.toFixed(1)}, Veh=${last.avg_veh.toFixed(1)}, ` +
+          `GO=${last.go}, STOP=${last.stop}, OFF=${last.off}`;
+      }
 
       chartsLoaded = true;
     } catch (e) {
@@ -392,28 +414,7 @@
   }
 
   function pushRealtimePoint(s){
-    const ts = new Date(s.ts * 1000).toLocaleTimeString();
-    if (densityChart) {
-      densityChart.data.labels.push(ts);
-      densityChart.data.datasets[0].data.push(s.ped_count);
-      densityChart.data.datasets[1].data.push(s.veh_count);
-      if (densityChart.data.labels.length > 60) {
-        densityChart.data.labels.shift();
-        densityChart.data.datasets.forEach(d => d.data.shift());
-      }
-      densityChart.update('none');
-    }
-    if (decisionChart) {
-      decisionChart.data.labels.push(ts);
-      decisionChart.data.datasets[0].data.push(s.action === "GO" ? 1 : 0);
-      decisionChart.data.datasets[1].data.push(s.action === "STOP" ? 1 : 0);
-      decisionChart.data.datasets[2].data.push(s.action === "OFF" ? 1 : 0);
-      if (decisionChart.data.labels.length > 120) {
-        decisionChart.data.labels.shift();
-        decisionChart.data.datasets.forEach(d => d.data.shift());
-      }
-      decisionChart.update('none');
-    }
+    // optional: if you want to append per-event to charts; we’re keeping charts hourly so we skip
   }
 
   async function loadArchive(limit=200){
