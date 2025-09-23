@@ -1,4 +1,4 @@
-  import eventlet
+import eventlet
 eventlet.monkey_patch()
 
 import os
@@ -50,7 +50,6 @@ def api_health():
     except Exception as e:
         return jsonify({"ok": False, "msg": repr(e)}), 500
 
-# ---- scenario logic ----
 def decide_scenario(now_ts: float, ped_count: int, veh_count: int,
                     tl_color: str, flags: Dict[str, bool]) -> Tuple[str, str]:
     if flags.get("ambulance", False):
@@ -63,16 +62,19 @@ def decide_scenario(now_ts: float, ped_count: int, veh_count: int,
     if tl_color == "red":
         action = "STOP"
     elif tl_color == "green":
-        if ped_count > 0 and veh_count > 0: action = "STOP"
-        elif ped_count > 0: action = "GO"
+        if ped_count > 0 and veh_count > 0:
+            action = "STOP"
+        elif ped_count > 0:
+            action = "GO"
     elif tl_color == "yellow":
         action = "STOP" if ped_count > 0 else "OFF"
     else:
-        if ped_count > 0 and veh_count > 0: action = "STOP"
-        elif ped_count > 0: action = "GO"
+        if ped_count > 0 and veh_count > 0:
+            action = "STOP"
+        elif ped_count > 0:
+            action = "GO"
     return (action, "baseline")
 
-# ---- MJPEG streaming ----
 def mjpeg_stream(key: str):
     boundary = b"--frame"
     header   = b"Content-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n"
@@ -91,7 +93,6 @@ def stream_cam(cam: str):
         return "unknown cam", 404
     return Response(mjpeg_stream(cam), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# ---- DB helpers ----
 def _db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=3.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -112,7 +113,6 @@ def _safe_query_rows(sql: str, args=()):
             return []
         raise
 
-# ---- REST APIs ----
 @app.get("/api/status")
 def api_status():
     with _state_lock:
@@ -172,7 +172,6 @@ def api_analytics():
         for (m, p, v, go, st, off) in rows
     ])
 
-# ---- realtime emits ----
 def tail_db_emit():
     print("[flask_app] DB tailer started")
     last_id = 0
@@ -206,7 +205,6 @@ def tail_db_emit():
             print("[flask_app] tailer error:", repr(e))
         socketio.sleep(DB_TAIL_INTERVAL_S)
 
-# ---- hooks from app.py ----
 def publish_frame(cam_key: str, frame: np.ndarray):
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     with _state_lock:
