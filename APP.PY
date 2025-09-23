@@ -9,7 +9,7 @@ import math
 import sqlite3
 import threading
 import re
-from queue import Queue
+from queue import Queue, Empty, Full
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Union
@@ -38,8 +38,8 @@ Set via env:
 # --------------------- CONFIGURATION ---------------------
 # YOLO
 YOLO_MODEL = os.getenv("SC_YOLO_MODEL", "yolov8n.pt")
-YOLO_CONF = float(os.getenv("SC_YOLO_CONF", "0.35"))
-YOLO_IMG_SZ = int(os.getenv("SC_YOLO_IMG", "416"))
+YOLO_CONF = float(os.getenv("SC_YOLO_CONF", "0.30"))
+YOLO_IMG_SZ = int(os.getenv("SC_YOLO_IMG", "416"))  # 416 runs much faster than 640 on CPU
 
 # Classes
 PEDESTRIAN_CLASSES = {"person"}
@@ -54,7 +54,11 @@ FRAME_W = int(os.getenv("SC_FRAME_W", "640"))
 FRAME_H = int(os.getenv("SC_FRAME_H", "360"))
 FPS_TARGET = int(os.getenv("SC_FPS", "15"))
 FRAME_TIME = 1.0 / max(1, FPS_TARGET)
-SKIP_FRAMES = int(os.getenv("SC_SKIP", "1"))  # user wants 1 (infer every frame)
+SKIP_FRAMES = int(os.getenv("SC_SKIP", "1"))  # infer every frame as requested
+
+# Throttle JPEG encodes (HUGE win). Inference still runs every frame.
+PUBLISH_HZ = float(os.getenv("SC_PUBLISH_HZ", "10"))  # 10 fps publish to browser
+_last_pub = {"ped": 0.0, "veh": 0.0, "tl": 0.0}
 
 # LED matrix (guarded init below)
 LED_CASCADE = int(os.getenv("SC_LED_CASCADE", "4"))
@@ -150,6 +154,24 @@ def _normalize_cam(value: Union[str, int, None]):
         return int(m.group(1))
     return s
 
+def q_replace_latest(q: Queue, item):
+    """Ensure worker always sees newest frame (no starvation)."""
+    try:
+        while True:
+            try:
+                q.get_nowait()
+            except Empty:
+                break
+        q.put_nowait(item)
+    except Full:
+        pass
+
+def publish_frame_throttled(key: str, frame: np.ndarray):
+    now = time.time()
+    if now - _last_pub.get(key, 0.0) >= (1.0 / max(1.0, PUBLISH_HZ)):
+        publish_frame(key, frame)
+        _last_pub[key] = now
+
 # --------------------- CAMERA THREAD ---------------------
 class CameraStream:
     def __init__(self, index: Union[int, str], width: int, height: int, fps: int):
@@ -182,7 +204,6 @@ class CameraStream:
                 raise RuntimeError(f"Could not open camera path {idx}")
             pretty = str(idx)
 
-        # low-latency
         try: self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception: pass
 
@@ -198,10 +219,8 @@ class CameraStream:
         if not set_fourcc('MJPG'):
             set_fourcc('YUYV') or set_fourcc('YUY2')
 
-        # warm-up
-        self.cap.read()
+        self.cap.read()  # warm-up
 
-        # log
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         f = self.cap.get(cv2.CAP_PROP_FPS)
@@ -301,7 +320,6 @@ class CentroidTracker:
             self.tracks[tr.id] = tr
             self.next_id += 1
 
-        # prune stale
         to_del = []
         for tid, tr in self.tracks.items():
             last_t, _, _ = tr.history[-1]
@@ -538,14 +556,14 @@ def run_pipeline():
             fv_s = fv if ok_veh else blank_640x360
             ft_s = ft if ok_tl  else blank_480x270
 
-            # enqueue latest frames for workers (respect SKIP_FRAMES)
+            # enqueue latest frames ALWAYS (replace-latest); respect SKIP_FRAMES
             if frame_idx % max(1, SKIP_FRAMES) == 0:
-                if ok_ped and ped_frames.empty():
-                    ped_frames.put(fp_s.copy())
-                if ok_veh and veh_frames.empty():
-                    veh_frames.put(fv_s.copy())
+                if ok_ped:
+                    q_replace_latest(ped_frames, fp_s.copy())
+                if ok_veh:
+                    q_replace_latest(veh_frames, fv_s.copy())
 
-            # get detections if available
+            # get detections if available (use most recent)
             det_p = ped_results.get_nowait() if not ped_results.empty() else []
             det_v = veh_results.get_nowait() if not veh_results.empty() else []
 
@@ -631,10 +649,10 @@ def run_pipeline():
             x, y, w, h = TRAFFIC_LIGHT_ROI
             cv2.rectangle(ft_s, (x, y), (x + w, y + h), COLOR_WHITE, 2)
 
-            # Push frames to web UI
-            publish_frame("ped", fp_s)
-            publish_frame("veh", fv_s)
-            publish_frame("tl",  ft_s)
+            # Push frames to web UI (throttled JPEG encode)
+            publish_frame_throttled("ped", fp_s)
+            publish_frame_throttled("veh", fv_s)
+            publish_frame_throttled("tl",  ft_s)
 
             # Status → website (throttled)
             now = time.time()
@@ -652,7 +670,7 @@ def run_pipeline():
                     avg_mps=avg_speed_mps,
                     flags=flags,
                     extra=extra,
-                    online=online,  # drives ONLINE/OFFLINE in UI
+                    online=online,
                 )
                 last_status_ts = now
 
@@ -703,11 +721,9 @@ def run_pipeline():
                 time.sleep(FRAME_TIME - elapsed)
 
     finally:
-        # stop cams
         for cam in (cam_ped, cam_veh, cam_tl):
             try: cam.stop()
             except Exception: pass
-        # stop workers
         try: ped_frames.put(None)
         except Exception: pass
         try: veh_frames.put(None)
