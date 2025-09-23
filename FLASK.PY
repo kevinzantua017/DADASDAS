@@ -1,27 +1,22 @@
-# flask_app.py
-import eventlet
-eventlet.monkey_patch()  # MUST be first
+  import eventlet
+eventlet.monkey_patch()
 
 import os
 import sqlite3
 import threading
-import time
 from typing import Dict, Optional, Tuple
-
-import cv2
-import numpy as np
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_socketio import SocketIO
+import cv2
+import numpy as np
 
 print("[flask_app] module import starting...")
 
-# --------------------- CONFIG ---------------------
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
-JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "70"))  # lower = smaller, faster
-STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.03"))
+JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "60"))
+STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.08"))
 DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "0.5"))
 
-# --------------------- SHARED STATE ---------------------
 latest_frames: Dict[str, Optional[np.ndarray]] = {"ped": None, "veh": None, "tl": None}
 latest_jpegs:  Dict[str, Optional[bytes]]     = {"ped": None, "veh": None, "tl": None}
 latest_status = {
@@ -33,12 +28,11 @@ latest_status = {
     "avg_vehicle_speed_mps": 0.0,
     "action": "OFF",
     "scenario": None,
-    "online": False,  # NEW: online/offline flag
+    "online": False,
 }
 
 _state_lock = threading.Lock()
 
-# --------------------- APP / SOCKET ---------------------
 app = Flask(__name__, static_folder="static", static_url_path="")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
@@ -56,7 +50,7 @@ def api_health():
     except Exception as e:
         return jsonify({"ok": False, "msg": repr(e)}), 500
 
-# --------------------- SCENARIO ---------------------
+# ---- scenario logic ----
 def decide_scenario(now_ts: float, ped_count: int, veh_count: int,
                     tl_color: str, flags: Dict[str, bool]) -> Tuple[str, str]:
     if flags.get("ambulance", False):
@@ -65,25 +59,20 @@ def decide_scenario(now_ts: float, ped_count: int, veh_count: int,
         return ("STOP", "scenario_1_night_ped")
     if flags.get("rush", False) and (5 <= ped_count <= 10) and veh_count >= 20 and tl_color == "red":
         return ("OFF", "scenario_2_rush_hold")
-    # baseline
     action = "OFF"
     if tl_color == "red":
         action = "STOP"
     elif tl_color == "green":
-        if ped_count > 0 and veh_count > 0:
-            action = "STOP"
-        elif ped_count > 0:
-            action = "GO"
+        if ped_count > 0 and veh_count > 0: action = "STOP"
+        elif ped_count > 0: action = "GO"
     elif tl_color == "yellow":
         action = "STOP" if ped_count > 0 else "OFF"
     else:
-        if ped_count > 0 and veh_count > 0:
-            action = "STOP"
-        elif ped_count > 0:
-            action = "GO"
+        if ped_count > 0 and veh_count > 0: action = "STOP"
+        elif ped_count > 0: action = "GO"
     return (action, "baseline")
 
-# --------------------- MJPEG STREAMING ---------------------
+# ---- MJPEG streaming ----
 def mjpeg_stream(key: str):
     boundary = b"--frame"
     header   = b"Content-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n"
@@ -98,12 +87,12 @@ def mjpeg_stream(key: str):
 
 @app.get("/stream/<cam>")
 def stream_cam(cam: str):
-    if cam not in ("ped", "veh", "tl"):
+    if cam not in ("ped","veh","tl"):
         return "unknown cam", 404
     return Response(mjpeg_stream(cam), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# --------------------- DB HELPERS ---------------------
-def _db_connect() -> sqlite3.Connection:
+# ---- DB helpers ----
+def _db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=3.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -123,7 +112,7 @@ def _safe_query_rows(sql: str, args=()):
             return []
         raise
 
-# --------------------- REST APIs ---------------------
+# ---- REST APIs ----
 @app.get("/api/status")
 def api_status():
     with _state_lock:
@@ -160,10 +149,13 @@ def api_analytics():
     rows = _safe_query_rows(
         """
         SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch') AS minute,
-               AVG(ped_count), AVG(veh_count),
-               SUM(action='GO'), SUM(action='STOP'), SUM(action='OFF')
+               AVG(ped_count) AS avg_ped,
+               AVG(veh_count) AS avg_veh,
+               SUM(CASE WHEN action='GO' THEN 1 ELSE 0 END)  AS go,
+               SUM(CASE WHEN action='STOP' THEN 1 ELSE 0 END) AS stop,
+               SUM(CASE WHEN action='OFF' THEN 1 ELSE 0 END)  AS off
         FROM events
-        WHERE ts >= strftime('%s','now','-60 minutes')
+        WHERE ts >= strftime('%s','now','-10 minutes')
         GROUP BY minute
         ORDER BY minute ASC
         """
@@ -180,7 +172,7 @@ def api_analytics():
         for (m, p, v, go, st, off) in rows
     ])
 
-# --------------------- realtime emits ---------------------
+# ---- realtime emits ----
 def tail_db_emit():
     print("[flask_app] DB tailer started")
     last_id = 0
@@ -214,7 +206,7 @@ def tail_db_emit():
             print("[flask_app] tailer error:", repr(e))
         socketio.sleep(DB_TAIL_INTERVAL_S)
 
-# --------------------- HOOKS (called by app.py) ---------------------
+# ---- hooks from app.py ----
 def publish_frame(cam_key: str, frame: np.ndarray):
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     with _state_lock:
@@ -223,8 +215,7 @@ def publish_frame(cam_key: str, frame: np.ndarray):
 
 def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
                              tl_color: str, nearest_m: float, avg_mps: float,
-                             flags: Dict[str, bool], extra: Dict[str, bool],
-                             online: bool = True):  # NEW ARG
+                             flags: Dict[str, bool], extra: Dict[str, bool], online: bool):
     action, scenario = decide_scenario(now_ts, ped_count, veh_count, tl_color, {
         "night": flags.get("night", False),
         "rush": flags.get("rush", False),
@@ -240,11 +231,10 @@ def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
             "avg_vehicle_speed_mps": float(avg_mps),
             "action": action,
             "scenario": scenario,
-            "online": bool(online),  # store online flag
+            "online": bool(online),
         })
     socketio.emit("status", latest_status, namespace="/realtime")
 
-# --------------------- MAIN ---------------------
 def start_http_server(host="0.0.0.0", port=5000):
     print(f"[flask_app] Starting Flask-SocketIO on http://{host}:{port} ...")
     socketio.start_background_task(tail_db_emit)
