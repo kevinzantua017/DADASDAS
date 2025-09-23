@@ -1,456 +1,244 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>AI-Driven LED Board Optimization</title>
-  <link rel="stylesheet" href="style.css"/>
-</head>
-<body>
-<div class="page-wrapper">
+  import eventlet
+eventlet.monkey_patch()
 
-  <!-- ================= LOGIN PAGE ================= -->
-  <div id="loginPage" class="login-body" style="display:flex;">
-    <div class="login-container">
-      <h2>AI-Driven LED Board System</h2>
-      <input id="user" type="text" placeholder="Username" autocomplete="username"/>
-      <input id="pass" type="password" placeholder="Password" autocomplete="current-password"/>
-      <button onclick="doLogin()">Login</button>
-      <p class="note">For demo: use any username & password</p>
-    </div>
-  </div>
+import os
+import sqlite3
+import threading
+from typing import Dict, Optional, Tuple
+from flask import Flask, Response, jsonify, request, send_from_directory
+from flask_socketio import SocketIO
+import cv2
+import numpy as np
 
-  <!-- ================= DASHBOARD PAGE ================= -->
-  <div id="dashboardPage" style="display:none;">
+print("[flask_app] module import starting...")
 
-    <!-- Navbar -->
-    <header>
-      <div class="header-container">
-        <div class="logo"><img src="images/Adamson.png" alt="Logo"></div>
-        <h1>LED-Board Optimization</h1>
-        <nav>
-          <a href="#" data-tab="dashboard" onclick="openTab('dashboard')">Dashboard</a>
-          <a href="#" data-tab="analytics" onclick="openTab('analytics')">Analytics</a>
-          <a href="#" data-tab="scenarios" onclick="openTab('scenarios')">Scenarios</a>
-          <a href="#" data-tab="logs" onclick="openTab('logs')">Archive</a>
-        </nav>
-        <button class="logout-btn" onclick="logout()">Logout</button>
-      </div>
-    </header>
+DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
+JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "60"))
+STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.08"))
+DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "0.5"))
 
-    <!-- Dashboard -->
-    <section id="dashboard" class="container active">
-      <h2>📡 Live Monitoring — Adamson University San Marcelino St.</h2>
+latest_frames: Dict[str, Optional[np.ndarray]] = {"ped": None, "veh": None, "tl": None}
+latest_jpegs:  Dict[str, Optional[bytes]]     = {"ped": None, "veh": None, "tl": None}
+latest_status = {
+    "ts": 0.0,
+    "ped_count": 0,
+    "veh_count": 0,
+    "tl_color": "unknown",
+    "nearest_vehicle_distance_m": 0.0,
+    "avg_vehicle_speed_mps": 0.0,
+    "action": "OFF",
+    "scenario": None,
+    "online": False,
+}
 
-      <div class="grid-dashboard">
-        <div class="card">
-          <h3>Pedestrian Camera</h3>
-          <div class="camera-feed">
-            <img id="camPed" alt="Pedestrian Camera" loading="eager">
-          </div>
-        </div>
+_state_lock = threading.Lock()
 
-        <div class="card">
-          <h3>Vehicle Camera</h3>
-          <div class="camera-feed">
-            <img id="camVeh" alt="Vehicle Camera" loading="eager">
-          </div>
-        </div>
+app = Flask(__name__, static_folder="static", static_url_path="")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-        <div class="card">
-          <h3>Traffic Light Detector</h3>
-          <div class="camera-feed">
-            <img id="camTL" alt="Traffic Light Camera" loading="eager">
-          </div>
-        </div>
-      </div>
+@app.get("/")
+def root_index():
+    return send_from_directory(app.static_folder, "index.html")
 
-      <div class="status-row">
-        <div class="card status">
-          <h3>System Status</h3>
-          <p><strong>Status:</strong> <span id="sysStatus" class="badge offline">OFFLINE</span></p>
-          <p id="sysDetail">TL: — | 🚶 0 | 🚗 0 | Nearest: 0.0 m | Speed: 0.0 m/s (0 km/h)</p>
-        </div>
+@app.get("/api/health")
+def api_health():
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=1.0)
+        conn.execute("PRAGMA user_version;")
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": repr(e)}), 500
 
-        <div class="card status">
-          <h3>Traffic Light & Next Action</h3>
-          <p>Current Light: <span id="tlLight" class="light">—</span></p>
-          <p>Next Action (live): <strong><span id="scenarioMessage">—</span></strong></p>
-        </div>
-      </div>
-    </section>
+# ---- scenario logic ----
+def decide_scenario(now_ts: float, ped_count: int, veh_count: int,
+                    tl_color: str, flags: Dict[str, bool]) -> Tuple[str, str]:
+    if flags.get("ambulance", False):
+        return ("STOP", "scenario_3_emergency")
+    if flags.get("night", False) and ped_count >= 30 and veh_count <= 2 and tl_color == "green":
+        return ("STOP", "scenario_1_night_ped")
+    if flags.get("rush", False) and (5 <= ped_count <= 10) and veh_count >= 20 and tl_color == "red":
+        return ("OFF", "scenario_2_rush_hold")
+    action = "OFF"
+    if tl_color == "red":
+        action = "STOP"
+    elif tl_color == "green":
+        if ped_count > 0 and veh_count > 0: action = "STOP"
+        elif ped_count > 0: action = "GO"
+    elif tl_color == "yellow":
+        action = "STOP" if ped_count > 0 else "OFF"
+    else:
+        if ped_count > 0 and veh_count > 0: action = "STOP"
+        elif ped_count > 0: action = "GO"
+    return (action, "baseline")
 
-    <!-- Analytics -->
-    <section id="analytics" class="container">
-      <h2>📊 Analytics (Hourly)</h2>
-      <div class="grid-2">
-        <div class="card" style="height:360px;">
-          <h3>Vehicle & Pedestrian Density (hourly)</h3>
-          <canvas id="densityChart"></canvas>
-        </div>
-        <div class="card" style="height:360px;">
-          <h3>Decision Breakdown (GO/STOP/OFF per hour)</h3>
-          <canvas id="decisionChart"></canvas>
-        </div>
-      </div>
+# ---- MJPEG streaming ----
+def mjpeg_stream(key: str):
+    boundary = b"--frame"
+    header   = b"Content-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n"
+    while True:
+        with _state_lock:
+            jpg = latest_jpegs.get(key)
+        if jpg is None:
+            socketio.sleep(0.03)
+            continue
+        yield boundary + b"\r\n" + header + jpg + b"\r\n"
+        socketio.sleep(STREAM_INTERVAL_S)
 
-      <div class="grid-2">
-        <div class="card">
-          <h3>Average Waiting Times (hourly)</h3>
-          <ul>
-            <li>🚶 Pedestrians (avg STOP duration/event): <strong id="avgWaitPed">—</strong></li>
-            <li>🚗 Vehicles (avg GO duration/event): <strong id="avgWaitVeh">—</strong></li>
-          </ul>
-          <small>Note: waiting time is approximated from consecutive action durations in logs sampled every 30s.</small>
-        </div>
-        <div class="card">
-          <h3>Latest Hour Summary</h3>
-          <p id="latestHourSummary">—</p>
-        </div>
-      </div>
-    </section>
+@app.get("/stream/<cam>")
+def stream_cam(cam: str):
+    if cam not in ("ped","veh","tl"):
+        return "unknown cam", 404
+    return Response(mjpeg_stream(cam), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-    <!-- Scenarios -->
-    <section id="scenarios" class="container">
-      <h2>🚦 Scenarios</h2>
+# ---- DB helpers ----
+def _db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=3.0, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=3000;")
+    return conn
 
-      <p><strong>LED Board:</strong> <span id="scenarioMessage2">—</span></p>
+def _safe_query_rows(sql: str, args=()):
+    try:
+        conn = _db_connect()
+        cur = conn.cursor()
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e).lower():
+            return []
+        raise
 
-      <div class="card scenario-card">
-        <div class="scenario-header">
-          <h3>Vehicle Priority</h3>
-          <div class="status-control">
-            <span class="status-text offline" id="status2">Offline</span>
-            <label class="switch">
-              <input type="checkbox" onchange="toggleScenario(this)">
-              <span class="slider"></span>
-            </label>
-          </div>
-        </div>
-        <ul>
-          <li><strong>Pedestrian Camera:</strong> 5–10 students waiting</li>
-          <li><strong>Vehicle Camera:</strong> Heavy traffic 20+ Vehicles</li>
-          <li><strong>Traffic Light:</strong> Red</li>
-        </ul>
-        <p><strong>YOLOv8 Action:</strong> System delays pedestrian crossing to ease vehicle congestion.<br>
-          LED: <em>“Vehicles Priority — Wait to Cross”</em></p>
-      </div>
+# ---- REST APIs ----
+@app.get("/api/status")
+def api_status():
+    with _state_lock:
+        return jsonify(latest_status)
 
-      <div class="card scenario-card">
-        <div class="scenario-header">
-          <h3>Pedestrian Priority</h3>
-          <div class="status-control">
-            <span class="status-text offline" id="status1">Offline</span>
-            <label class="switch">
-              <input type="checkbox" onchange="toggleScenario(this)">
-              <span class="slider"></span>
-            </label>
-          </div>
-        </div>
-        <ul>
-          <li><strong>Pedestrian Camera:</strong> 30+ civilians waiting</li>
-          <li><strong>Vehicle Camera:</strong> 0–5 Vehicles</li>
-          <li><strong>Traffic Light:</strong> Green</li>
-        </ul>
-        <p><strong>YOLOv8 Action:</strong> Prioritize pedestrians (high density, low vehicles).<br>
-          LED: <em>“Prepare to Stop — Pedestrians Crossing”</em>, then <em>“Safe to Cross”</em> on red.</p>
-      </div>
+@app.get("/api/logs")
+def api_logs():
+    limit = int(request.args.get("limit", 100))
+    rows = _safe_query_rows(
+        """
+        SELECT ts, ped_count, veh_count, tl_color,
+               nearest_vehicle_distance_m, avg_vehicle_speed_mps, action
+        FROM events
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return jsonify([
+        {
+            "ts": float(r[0]),
+            "ped_count": int(r[1]),
+            "veh_count": int(r[2]),
+            "tl_color": str(r[3]),
+            "nearest_vehicle_distance_m": float(r[4]),
+            "avg_vehicle_speed_mps": float(r[5]),
+            "action": str(r[6]),
+        }
+        for r in rows
+    ])
 
-      <div class="card scenario-card">
-        <div class="scenario-header">
-          <h3>Emergency Vehicle Detected</h3>
-          <div class="status-control">
-            <span class="status-text offline" id="status3">Offline</span>
-            <label class="switch">
-              <input type="checkbox" onchange="toggleScenario(this)">
-              <span class="slider"></span>
-            </label>
-          </div>
-        </div>
-        <ul>
-          <li><strong>Pedestrian Camera:</strong> ~20 waiting</li>
-          <li><strong>Vehicle Camera:</strong> Ambulance with siren</li>
-          <li><strong>Traffic Light:</strong> Yellow → Red</li>
-        </ul>
-        <p><strong>YOLOv8 Action:</strong> Override for ambulance right-of-way.<br>
-          LED: <em>“Emergency Vehicle Passing — Please Wait”</em> → Safe to Cross</p>
-      </div>
-    </section>
+@app.get("/api/analytics")
+def api_analytics():
+    rows = _safe_query_rows(
+        """
+        SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch') AS minute,
+               AVG(ped_count) AS avg_ped,
+               AVG(veh_count) AS avg_veh,
+               SUM(CASE WHEN action='GO' THEN 1 ELSE 0 END)  AS go,
+               SUM(CASE WHEN action='STOP' THEN 1 ELSE 0 END) AS stop,
+               SUM(CASE WHEN action='OFF' THEN 1 ELSE 0 END)  AS off
+        FROM events
+        WHERE ts >= strftime('%s','now','-10 minutes')
+        GROUP BY minute
+        ORDER BY minute ASC
+        """
+    )
+    return jsonify([
+        {
+            "minute": m,
+            "avg_ped": float(p or 0),
+            "avg_veh": float(v or 0),
+            "go": int(go or 0),
+            "stop": int(st or 0),
+            "off": int(off or 0),
+        }
+        for (m, p, v, go, st, off) in rows
+    ])
 
-    <!-- Logs -->
-    <section id="logs" class="container">
-      <h2>🗂️ System Logs</h2>
-      <div class="table-scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Event</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
+# ---- realtime emits ----
+def tail_db_emit():
+    print("[flask_app] DB tailer started")
+    last_id = 0
+    while True:
+        try:
+            rows = _safe_query_rows(
+                """
+                SELECT id, ts, ped_count, veh_count, tl_color,
+                       nearest_vehicle_distance_m, avg_vehicle_speed_mps, action
+                FROM events
+                ORDER BY id DESC LIMIT 1
+                """
+            )
+            if rows:
+                row = rows[0]
+                if row[0] != last_id:
+                    last_id = row[0]
+                    payload = {
+                        "ts": float(row[1]),
+                        "ped_count": int(row[2]),
+                        "veh_count": int(row[3]),
+                        "tl_color": str(row[4]),
+                        "nearest_vehicle_distance_m": float(row[5]),
+                        "avg_vehicle_speed_mps": float(row[6]),
+                        "action": str(row[7]),
+                        "online": latest_status.get("online", False),
+                    }
+                    socketio.emit("status", payload, namespace="/realtime")
+                    socketio.emit("log_insert", payload, namespace="/realtime")
+        except Exception as e:
+            print("[flask_app] tailer error:", repr(e))
+        socketio.sleep(DB_TAIL_INTERVAL_S)
 
-    <!-- Footer -->
-    <footer>
-      <p>© 2025 Adamson University | AI-Driven LED Board Optimization</p>
-    </footer>
+# ---- hooks from app.py ----
+def publish_frame(cam_key: str, frame: np.ndarray):
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    with _state_lock:
+        latest_frames[cam_key] = frame
+        latest_jpegs[cam_key]  = buf.tobytes() if ok else None
 
-  </div> <!-- /dashboardPage -->
+def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
+                             tl_color: str, nearest_m: float, avg_mps: float,
+                             flags: Dict[str, bool], extra: Dict[str, bool], online: bool):
+    action, scenario = decide_scenario(now_ts, ped_count, veh_count, tl_color, {
+        "night": flags.get("night", False),
+        "rush": flags.get("rush", False),
+        "ambulance": extra.get("ambulance", False),
+    })
+    with _state_lock:
+        latest_status.update({
+            "ts": float(now_ts),
+            "ped_count": int(ped_count),
+            "veh_count": int(veh_count),
+            "tl_color": str(tl_color),
+            "nearest_vehicle_distance_m": float(nearest_m),
+            "avg_vehicle_speed_mps": float(avg_mps),
+            "action": action,
+            "scenario": scenario,
+            "online": bool(online),
+        })
+    socketio.emit("status", latest_status, namespace="/realtime")
 
-</div> <!-- /page-wrapper -->
+def start_http_server(host="0.0.0.0", port=5000):
+    print(f"[flask_app] Starting Flask-SocketIO on http://{host}:{port} ...")
+    socketio.start_background_task(tail_db_emit)
+    socketio.run(app, host=host, port=port, debug=False)
 
-<!-- ================= JAVASCRIPT ================= -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-<script>
-  // ========= CONFIG =========
-  const BASE_URL = "http://192.168.137.214:5000";   // Flask on the Pi
-  const USE_REALTIME_LOGS = false;                  // we poll for Archive table
-
-  let densityChart, decisionChart, chartsLoaded = false;
-  let logsTimer = null;                             // 30s polling timer for Archive
-
-  // ========= LOGIN =========
-  function doLogin(){
-    const u = document.getElementById('user').value.trim();
-    const p = document.getElementById('pass').value.trim();
-    if (!u || !p) { alert("Enter any username and password for demo"); return; }
-    localStorage.setItem("loggedInUser", u);
-    showDashboard();
-  }
-
-  function logout(){
-    localStorage.removeItem("loggedInUser");
-    localStorage.removeItem("activeTab");
-    showLogin();
-  }
-
-  function showDashboard(){
-    const lp = document.getElementById("loginPage");
-    const dp = document.getElementById("dashboardPage");
-    if (lp) lp.style.display = "none";
-    if (dp) dp.style.display = "block";
-    setCamSrcs();
-    openTab(localStorage.getItem("activeTab") || "dashboard");
-  }
-
-  function showLogin(){
-    const lp = document.getElementById("loginPage");
-    const dp = document.getElementById("dashboardPage");
-    if (lp) lp.style.display = "flex";
-    if (dp) dp.style.display = "none";
-  }
-
-  // On load, skip login if remembered
-  window.addEventListener("load", () => {
-    if (localStorage.getItem("loggedInUser")) showDashboard();
-    else showLogin();
-  });
-
-  // ========= TABS =========
-  function openTab(tabId) {
-    document.querySelectorAll('.container').forEach(s => s.classList.remove('active'));
-    const el = document.getElementById(tabId);
-    if (el) el.classList.add('active');
-
-    document.querySelectorAll('header nav a').forEach(a => {
-      a.classList.toggle('active', a.getAttribute('data-tab') === tabId);
-    });
-
-    localStorage.setItem("activeTab", tabId);
-
-    if (tabId === "analytics") loadAnalytics();
-
-    // 30s polling for Archive tab only
-    if (tabId === "logs") {
-      loadArchive();  // initial load immediately
-      if (!logsTimer) {
-        logsTimer = setInterval(() => loadArchive(), 30000); // 30 seconds
-      }
-    } else {
-      if (logsTimer) {
-        clearInterval(logsTimer);
-        logsTimer = null;
-      }
-    }
-  }
-
-  function setCamSrcs() {
-    const ped = document.getElementById("camPed");
-    const veh = document.getElementById("camVeh");
-    const tl  = document.getElementById("camTL");
-    if (ped) ped.src = BASE_URL + "/stream/ped";
-    if (veh) veh.src = BASE_URL + "/stream/veh";
-    if (tl)  tl.src  = BASE_URL + "/stream/tl";
-  }
-
-  // ========= SOCKET.IO (Realtime) =========
-  const socket = io(BASE_URL + "/realtime", { transports: ["websocket"] });
-
-  function scenarioBanner(s) {
-    const base = s.action === "GO" ? "Safe to Cross" : (s.action === "STOP" ? "Stop" : "Standby");
-    const map = {
-      scenario_1_night_ped: "Prepare to Stop — Pedestrians Crossing",
-      scenario_2_rush_hold: "Vehicles Priority — Wait to Cross",
-      scenario_3_emergency: "Emergency Vehicle Passing — Please Wait",
-      baseline: base
-    };
-    return map[s.scenario || "baseline"];
-  }
-
-  socket.on("status", (s) => {
-    // System status card
-    const sysStatus = document.getElementById("sysStatus");
-    const sysDetail = document.getElementById("sysDetail");
-    if (sysStatus) {
-      sysStatus.textContent = s.online ? "ONLINE" : "OFFLINE";
-      sysStatus.classList.toggle("online", !!s.online);
-      sysStatus.classList.toggle("offline", !s.online);
-    }
-    if (sysDetail) {
-      sysDetail.textContent =
-        `TL: ${(s.tl_color||'').toUpperCase()} | 🚶 ${s.ped_count} | 🚗 ${s.veh_count} | ` +
-        `Nearest: ${Number(s.nearest_vehicle_distance_m).toFixed(1)} m | ` +
-        `Speed: ${Number(s.avg_vehicle_speed_mps).toFixed(1)} m/s (${(Number(s.avg_vehicle_speed_mps)*3.6).toFixed(0)} km/h)`;
-    }
-
-    // Light color label and scenario banners
-    const lightSpan = document.getElementById('tlLight');
-    if (lightSpan) {
-      lightSpan.className = 'light ' + (s.tl_color || '');
-      lightSpan.textContent = (s.tl_color||'').toUpperCase();
-    }
-    const msg1 = document.getElementById("scenarioMessage");
-    const msg2 = document.getElementById("scenarioMessage2");
-    const text = scenarioBanner(s);
-    if (msg1) msg1.textContent = text;
-    if (msg2) msg2.textContent = text;
-
-    if (typeof pushRealtimePoint === "function") pushRealtimePoint(s);
-
-    // Scenario pills
-    document.getElementById("status1")?.classList.toggle("active", s.scenario === "scenario_1_night_ped");
-    document.getElementById("status1")?.classList.toggle("offline", s.scenario !== "scenario_1_night_ped");
-
-    document.getElementById("status2")?.classList.toggle("active", s.scenario === "scenario_2_rush_hold");
-    document.getElementById("status2")?.classList.toggle("offline", s.scenario !== "scenario_2_rush_hold");
-
-    document.getElementById("status3")?.classList.toggle("active", s.scenario === "scenario_3_emergency");
-    document.getElementById("status3")?.classList.toggle("offline", s.scenario !== "scenario_3_emergency");
-  });
-
-  if (USE_REALTIME_LOGS) {
-    socket.on("log_insert", (row) => {
-      const tbody = document.querySelector("#logs tbody");
-      if (!tbody) return;
-      const tr = document.createElement("tr");
-      const t = new Date(row.ts * 1000).toLocaleTimeString();
-      tr.innerHTML = `
-        <td>${t}</td>
-        <td>Ped: ${row.ped_count}, Veh: ${row.veh_count}, TL: ${(String(row.tl_color)||'').toUpperCase()}</td>
-        <td>${row.action}</td>`;
-      tbody.prepend(tr);
-      while (tbody.rows.length > 200) tbody.deleteRow(-1);
-    });
-  }
-
-  // ========= ANALYTICS & ARCHIVE =========
-  async function loadAnalytics(){
-    if (chartsLoaded) return;
-    try {
-      const res = await fetch(BASE_URL + "/api/analytics");
-      const rows = await res.json();
-
-      const labels = rows.map(r => r.hour);
-      const ped = rows.map(r => r.avg_ped);
-      const veh = rows.map(r => r.avg_veh);
-      const go  = rows.map(r => r.go);
-      const stop= rows.map(r => r.stop);
-      const off = rows.map(r => r.off);
-
-      densityChart = new Chart(document.getElementById('densityChart'), {
-        type: 'bar',
-        data: { labels,
-          datasets: [
-            { label: 'Avg Pedestrians / hr', data: ped },
-            { label: 'Avg Vehicles / hr', data: veh },
-          ]
-        },
-        options: { responsive: true, maintainAspectRatio: false }
-      });
-
-      decisionChart = new Chart(document.getElementById('decisionChart'), {
-        type: 'line',
-        data: { labels,
-          datasets: [
-            { label: 'GO (count/hr)', data: go },
-            { label: 'STOP (count/hr)', data: stop },
-            { label: 'OFF (count/hr)', data: off },
-          ]
-        },
-        options: { responsive: true, maintainAspectRatio: false }
-      });
-
-      // Average waiting times — display latest hour values if present
-      if (rows.length) {
-        const last = rows[rows.length - 1];
-        document.getElementById('avgWaitPed').textContent =
-          isFinite(last.avg_wait_ped_s) ? `${last.avg_wait_ped_s.toFixed(0)} s` : '—';
-        document.getElementById('avgWaitVeh').textContent =
-          isFinite(last.avg_wait_veh_s) ? `${last.avg_wait_veh_s.toFixed(0)} s` : '—';
-        document.getElementById('latestHourSummary').textContent =
-          `${last.hour}: Ped=${last.avg_ped.toFixed(1)}, Veh=${last.avg_veh.toFixed(1)}, ` +
-          `GO=${last.go}, STOP=${last.stop}, OFF=${last.off}`;
-      }
-
-      chartsLoaded = true;
-    } catch (e) {
-      console.error("Analytics load failed:", e);
-    }
-  }
-
-  function pushRealtimePoint(s){
-    // optional: if you want to append per-event to charts; we’re keeping charts hourly so we skip
-  }
-
-  async function loadArchive(limit=200){
-    try {
-      const res = await fetch(BASE_URL + "/api/logs?limit=" + encodeURIComponent(limit));
-      const rows = await res.json();
-      const tbody = document.querySelector("#logs tbody");
-      if (!tbody) return;
-      tbody.innerHTML = "";
-      rows.reverse().forEach(r => {
-        const tr = document.createElement("tr");
-        const t = new Date(r.ts * 1000).toLocaleTimeString();
-        tr.innerHTML = `<td>${t}</td>
-                        <td>Ped: ${r.ped_count}, Veh: ${r.veh_count}, TL: ${(String(r.tl_color)||'').toUpperCase()}</td>
-                        <td>${r.action}</td>`;
-        tbody.appendChild(tr);
-      });
-    } catch (e) {
-      console.error("Archive load failed:", e);
-    }
-  }
-
-  // ========= Scenario toggle (UI only) =========
-  function toggleScenario(checkbox) {
-    const statusText = checkbox.closest('.scenario-header').querySelector('.status-text');
-    if (!statusText) return;
-    if (checkbox.checked) {
-      statusText.textContent = "Active";
-      statusText.classList.remove("offline");
-      statusText.classList.add("active");
-    } else {
-      statusText.textContent = "Offline";
-      statusText.classList.remove("active");
-      statusText.classList.add("offline");
-    }
-  }
-</script>
-</body>
-</html>
+if __name__ == "__main__":
+    start_http_server()
