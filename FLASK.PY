@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -16,9 +16,9 @@ print("[flask_app] module import starting...")
 
 # --------------------- CONFIG ---------------------
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
-JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "70"))  # lower = smaller, faster
-STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.03"))
-DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "0.5"))
+JPEG_QUALITY = int(os.getenv("SC_JPEG_QUALITY", "60"))  # lower = smaller, faster (tuned for Pi)
+STREAM_INTERVAL_S = float(os.getenv("SC_STREAM_INTERVAL", "0.05"))  # slightly slower to reduce CPU
+DB_TAIL_INTERVAL_S = float(os.getenv("SC_DB_TAIL_INTERVAL", "5.0"))  # slower; Archive polls every 30s anyway
 
 # --------------------- SHARED STATE ---------------------
 latest_frames: Dict[str, Optional[np.ndarray]] = {"ped": None, "veh": None, "tl": None}
@@ -32,9 +32,11 @@ latest_status = {
     "avg_vehicle_speed_mps": 0.0,
     "action": "OFF",
     "scenario": None,
+    "online": False,  # NEW: reflects camera health
 }
 
 _state_lock = threading.Lock()
+_last_status_emit = 0.0  # throttle realtime emits a bit
 
 # --------------------- APP / SOCKET ---------------------
 app = Flask(__name__, static_folder="static", static_url_path="")
@@ -129,7 +131,7 @@ def api_status():
 
 @app.get("/api/logs")
 def api_logs():
-    limit = int(request.args.get("limit", 100))
+    limit = int(request.args.get("limit", 200))
     rows = _safe_query_rows(
         """
         SELECT ts, ped_count, veh_count, tl_color,
@@ -153,30 +155,85 @@ def api_logs():
         for r in rows
     ])
 
+def _compute_hourly_analytics(rows: List[tuple]):
+    """
+    rows: tuples of (ts, ped_count, veh_count, action)
+    returns per-hour aggregates (last 24h)
+    """
+    if not rows:
+        return []
+
+    # Bucket by hour key
+    from collections import defaultdict
+    buckets = defaultdict(lambda: {
+        "sum_ped": 0.0, "sum_veh": 0.0, "n": 0,
+        "go": 0, "stop": 0, "off": 0,
+        "dur_go": 0.0, "dur_stop": 0.0
+    })
+
+    # Sort ascending by ts to compute durations
+    rows_sorted = sorted(rows, key=lambda r: r[0])
+
+    # Estimate durations between consecutive samples
+    # Cap gaps at 120s to avoid inflating from long outages
+    for i, r in enumerate(rows_sorted):
+        ts, ped, veh, action = float(r[0]), int(r[1]), int(r[2]), str(r[3])
+        hour_key = time.strftime("%Y-%m-%d %H:00", time.localtime(ts))
+
+        b = buckets[hour_key]
+        b["sum_ped"] += ped
+        b["sum_veh"] += veh
+        b["n"] += 1
+        if action == "GO":
+            b["go"] += 1
+        elif action == "STOP":
+            b["stop"] += 1
+        else:
+            b["off"] += 1
+
+        # duration contribution until next sample
+        if i < len(rows_sorted) - 1:
+            ts_next = float(rows_sorted[i+1][0])
+            dt = max(0.0, min(120.0, ts_next - ts))
+        else:
+            dt = 0.0
+
+        # Heuristic: STOP → pedestrians are waiting; GO → vehicles are waiting
+        if action == "STOP":
+            b["dur_stop"] += dt
+        elif action == "GO":
+            b["dur_go"] += dt
+
+    # Build results ordered by hour
+    out = []
+    for hk in sorted(buckets.keys()):
+        b = buckets[hk]
+        n = max(1, b["n"])
+        out.append({
+            "hour": hk,
+            "avg_ped": b["sum_ped"] / n,
+            "avg_veh": b["sum_veh"] / n,
+            "go": b["go"],
+            "stop": b["stop"],
+            "off": b["off"],
+            "avg_wait_ped_s": b["dur_stop"] / max(1, b["stop"]),  # average STOP duration per STOP event in that hour
+            "avg_wait_veh_s": b["dur_go"] / max(1, b["go"]),      # average GO duration per GO event in that hour
+        })
+    return out[-24:]  # last 24 hours max
+
 @app.get("/api/analytics")
 def api_analytics():
+    # Pull last 24h of events
     rows = _safe_query_rows(
         """
-        SELECT strftime('%Y-%m-%d %H:%M', ts, 'unixepoch') AS minute,
-               AVG(ped_count), AVG(veh_count),
-               SUM(action='GO'), SUM(action='STOP'), SUM(action='OFF')
+        SELECT ts, ped_count, veh_count, action
         FROM events
-        WHERE ts >= strftime('%s','now','-60 minutes')
-        GROUP BY minute
-        ORDER BY minute ASC
+        WHERE ts >= strftime('%s','now','-24 hours')
+        ORDER BY ts ASC
         """
     )
-    return jsonify([
-        {
-            "minute": m,
-            "avg_ped": float(p or 0),
-            "avg_veh": float(v or 0),
-            "go": int(go or 0),
-            "stop": int(st or 0),
-            "off": int(off or 0),
-        }
-        for (m, p, v, go, st, off) in rows
-    ])
+    hourly = _compute_hourly_analytics(rows)
+    return jsonify(hourly)
 
 # --------------------- realtime emits ---------------------
 def tail_db_emit():
@@ -205,7 +262,7 @@ def tail_db_emit():
                         "avg_vehicle_speed_mps": float(row[6]),
                         "action": str(row[7]),
                     }
-                    socketio.emit("status", payload, namespace="/realtime")
+                    socketio.emit("status", payload, namespace="/realtime")  # lightweight
                     socketio.emit("log_insert", payload, namespace="/realtime")
         except Exception as e:
             print("[flask_app] tailer error:", repr(e))
@@ -221,12 +278,14 @@ def publish_frame(cam_key: str, frame: np.ndarray):
 
 def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
                              tl_color: str, nearest_m: float, avg_mps: float,
-                             flags: Dict[str, bool], extra: Dict[str, bool]):
+                             flags: Dict[str, bool], extra: Dict[str, bool], online: bool):
     action, scenario = decide_scenario(now_ts, ped_count, veh_count, tl_color, {
         "night": flags.get("night", False),
         "rush": flags.get("rush", False),
         "ambulance": extra.get("ambulance", False),
     })
+    emit_now = False
+    global _last_status_emit
     with _state_lock:
         latest_status.update({
             "ts": float(now_ts),
@@ -237,8 +296,14 @@ def publish_status_from_loop(now_ts: float, ped_count: int, veh_count: int,
             "avg_vehicle_speed_mps": float(avg_mps),
             "action": action,
             "scenario": scenario,
+            "online": bool(online),
         })
-    socketio.emit("status", latest_status, namespace="/realtime")
+        # throttle emits to ~5 Hz max (200ms)
+        if (now_ts - _last_status_emit) >= 0.2:
+            emit_now = True
+            _last_status_emit = now_ts
+    if emit_now:
+        socketio.emit("status", latest_status, namespace="/realtime")
 
 # --------------------- MAIN ---------------------
 def start_http_server(host="0.0.0.0", port=5000):
