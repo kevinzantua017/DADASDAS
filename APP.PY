@@ -9,9 +9,10 @@ import math
 import sqlite3
 import threading
 import re
+from queue import Queue
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Union
 
 import numpy as np
 from ultralytics import YOLO
@@ -28,12 +29,10 @@ SHOW_WINDOWS = False  # keep False on headless
 PRINT_DEBUG = True
 
 """
-Cameras:
-  Pass either numeric indices (0,1,2) or stable device paths:
+Cameras: pass either numeric indices or device paths:
   /dev/videoN  OR  /dev/v4l/by-id/usb-...-video-index0
-
-  Set via env:
-    SC_CAM_PED, SC_CAM_VEH, SC_CAM_TL
+Set via env:
+  SC_CAM_PED, SC_CAM_VEH, SC_CAM_TL
 """
 
 # --------------------- CONFIGURATION ---------------------
@@ -46,12 +45,16 @@ YOLO_IMG_SZ = int(os.getenv("SC_YOLO_IMG", "416"))
 PEDESTRIAN_CLASSES = {"person"}
 VEHICLE_CLASSES = {"car", "truck", "bus", "motorbike", "bicycle"}
 
+# COCO indices for fast-class filtering at inference
+COCO_PED = [0]
+COCO_VEH = [1, 2, 3, 5, 7]
+
 # Frames (lighter for 3 cams)
 FRAME_W = int(os.getenv("SC_FRAME_W", "640"))
 FRAME_H = int(os.getenv("SC_FRAME_H", "360"))
-FPS_TARGET = int(os.getenv("SC_FPS", "12"))
+FPS_TARGET = int(os.getenv("SC_FPS", "15"))
 FRAME_TIME = 1.0 / max(1, FPS_TARGET)
-SKIP_FRAMES = int(os.getenv("SC_SKIP", "2"))  # infer every Nth frame (default 2)
+SKIP_FRAMES = int(os.getenv("SC_SKIP", "1"))  # user wants 1 (infer every frame)
 
 # LED matrix (guarded init below)
 LED_CASCADE = int(os.getenv("SC_LED_CASCADE", "4"))
@@ -79,7 +82,6 @@ HSV_GREEN  = ((40, 70, 70), (90, 255, 255))
 
 # Logging / DB
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
-# Time-based logging cadence (seconds) to avoid spamming DB
 LOG_EVERY_SEC = int(os.getenv("SC_LOG_SEC", "30"))
 
 # Drawing
@@ -88,6 +90,10 @@ COLOR_RED    = (0, 0, 255)
 COLOR_YELLOW = (0, 255, 255)
 COLOR_WHITE  = (255, 255, 255)
 COLOR_BLUE   = (255, 0, 0)
+
+# Status throttle (reduce socket churn)
+STATUS_MIN_PERIOD = float(os.getenv("SC_STATUS_PERIOD", "0.25"))  # seconds, default 4Hz
+
 
 # --------------------- LED (guarded) ---------------------
 def _init_led():
@@ -117,10 +123,10 @@ def _init_led():
 show_led = _init_led()
 
 # --------------------- HELPERS ---------------------
-def _normalize_cam(value):
+def _normalize_cam(value: Union[str, int, None]):
     """
     Accepts int, numeric string, /dev/videoN, or /dev/v4l/by-id/*.
-    Returns an int index (preferred) if it can resolve to /dev/videoN, else the original string/path.
+    Returns an int /dev/videoN if resolvable, else the original string/path.
     """
     if value is None:
         return None
@@ -135,7 +141,6 @@ def _normalize_cam(value):
             m = re.match(r"^/dev/video(\d+)$", real)
             if m:
                 return int(m.group(1))
-            # fallback to the resolved path if not /dev/videoN but still exists
             if os.path.exists(real):
                 return real
     except Exception:
@@ -147,8 +152,8 @@ def _normalize_cam(value):
 
 # --------------------- CAMERA THREAD ---------------------
 class CameraStream:
-    def __init__(self, index, width: int, height: int, fps: int):
-        self.index = index  # may be int or path string
+    def __init__(self, index: Union[int, str], width: int, height: int, fps: int):
+        self.index = index
         self.width = width
         self.height = height
         self.fps = fps
@@ -161,34 +166,25 @@ class CameraStream:
         self.thread.start()
 
     def _open_camera(self):
-        """
-        Open the camera using numeric index (preferred) or a device path.
-        If a /dev/v4l/by-id symlink is given, resolve it to /dev/videoN and
-        pass the numeric index to OpenCV (more reliable on some builds).
-        """
         idx = _normalize_cam(self.index)
-
-        # Prefer numeric
         if isinstance(idx, int):
             self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if not self.cap.isOpened():
                 self.cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
             if not self.cap.isOpened():
                 raise RuntimeError(f"Could not open camera index {idx}")
-            pretty_name = f"/dev/video{idx}"
+            pretty = f"/dev/video{idx}"
         else:
             self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if not self.cap.isOpened():
                 self.cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
             if not self.cap.isOpened():
                 raise RuntimeError(f"Could not open camera path {idx}")
-            pretty_name = str(idx)
+            pretty = str(idx)
 
-        # lower latency: avoid deep buffering
-        try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+        # low-latency
+        try: self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception: pass
 
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
@@ -205,19 +201,17 @@ class CameraStream:
         # warm-up
         self.cap.read()
 
-        # Log negotiated mode
+        # log
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         f = self.cap.get(cv2.CAP_PROP_FPS)
         fourcc_val = int(self.cap.get(cv2.CAP_PROP_FOURCC))
         fourcc_str = "".join([chr((fourcc_val >> 8*i) & 0xFF) for i in range(4)])
-        print(f"[OPEN] {pretty_name} -> {w}x{h}@{f:.1f} FOURCC={fourcc_str}")
+        print(f"[OPEN] {pretty} -> {w}x{h}@{f:.1f} FOURCC={fourcc_str}")
 
     def _reopen_once(self):
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+        try: self.cap.release()
+        except Exception: pass
         time.sleep(0.2)
         self._open_camera()
 
@@ -230,7 +224,7 @@ class CameraStream:
             if not ret or frame is None:
                 no_frame += 1
                 if no_frame == 20:
-                    print(f"[INFO] Reopening camera due to stalled frames…")
+                    print("[INFO] Reopening camera due to stalled frames…")
                     self._reopen_once()
                     no_frame = 0
                 time.sleep(0.02)
@@ -238,7 +232,6 @@ class CameraStream:
             else:
                 no_frame = 0
 
-            # Resize here so main loop stays light
             if frame.shape[1] != self.width or frame.shape[0] != self.height:
                 frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
 
@@ -246,7 +239,6 @@ class CameraStream:
                 self.ret = True
                 self.frame = frame
 
-            # throttle to target FPS (avoid overspinning)
             now = time.time()
             sleep_left = frame_interval - (now - last_t)
             if sleep_left > 0:
@@ -259,14 +251,10 @@ class CameraStream:
 
     def stop(self):
         self.stopped = True
-        try:
-            self.thread.join(timeout=1.0)
-        except Exception:
-            pass
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+        try: self.thread.join(timeout=1.0)
+        except Exception: pass
+        try: self.cap.release()
+        except Exception: pass
 
 # --------------------- SIMPLE TRACKER ---------------------
 @dataclass
@@ -340,9 +328,20 @@ class CentroidTracker:
 
 # --------------------- YOLO ---------------------
 model = YOLO(YOLO_MODEL)
+try:
+    model.fuse()  # fuse Conv+BN for speed
+except Exception:
+    pass
 
-def yolo_detect(frame: np.ndarray, conf: float, img_size: int):
-    res = model.predict(frame, conf=conf, imgsz=img_size, verbose=False)
+def yolo_detect(frame: np.ndarray, conf: float, img_size: int, classes=None):
+    res = model.predict(
+        frame,
+        conf=conf,
+        imgsz=img_size,
+        verbose=False,
+        max_det=50,
+        classes=classes,   # FAST: restrict classes inside predictor
+    )
     boxes = []  # (label, (x1,y1,x2,y2), conf)
     r0 = res[0]
     names = r0.names
@@ -352,9 +351,6 @@ def yolo_detect(frame: np.ndarray, conf: float, img_size: int):
         x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
         boxes.append((label, (x1, y1, x2, y2), float(b.conf[0])))
     return boxes
-
-def filter_classes(boxes, keep: set):
-    return [(label, xyxy, cf) for label, xyxy, cf in boxes if label in keep]
 
 # --------------------- DB ---------------------
 def init_db(path: str):
@@ -417,11 +413,8 @@ def detect_traffic_light_color(frame: np.ndarray) -> str:
         return "unknown"
     return best
 
+# --------------------- CAMERA PICKING ---------------------
 def safe_camera(index) -> Optional[int | str]:
-    """
-    Returns normalized index/path if it opens & reads 1 frame, else None.
-    Forces MJPG @ modest size/FPS to avoid blocking.
-    """
     idx = _normalize_cam(index)
     try:
         cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
@@ -440,10 +433,6 @@ def safe_camera(index) -> Optional[int | str]:
         return None
 
 def pick_cameras():
-    """
-    Picks cameras based on env vars if provided, else auto-scans /dev/video0..9.
-    Supports both numeric indices and device paths.
-    """
     ped_env = os.getenv("SC_CAM_PED")
     veh_env = os.getenv("SC_CAM_VEH")
     tl_env  = os.getenv("SC_CAM_TL")
@@ -452,13 +441,11 @@ def pick_cameras():
         ped = _normalize_cam(ped_env)
         veh = _normalize_cam(veh_env)
         tl  = _normalize_cam(tl_env)
-
         ok_all = [safe_camera(ped), safe_camera(veh), safe_camera(tl)]
         if all(x is not None for x in ok_all):
             return ped, veh, tl
         raise RuntimeError(f"One or more SC_CAM_* env cameras failed to open: {ok_all}")
 
-    # else auto-scan /dev/video0..9
     candidates = []
     for idx in range(10):
         ok = safe_camera(idx)
@@ -470,13 +457,31 @@ def pick_cameras():
         raise RuntimeError(f"Found only {len(candidates)} working cameras: {candidates}.")
     return candidates[0], candidates[1], candidates[2]
 
-# --------------------- MAIN PIPELINE (runs in a thread) ---------------------
+# --------------------- YOLO WORKERS ---------------------
+def yolo_worker(frame_q: Queue, result_q: Queue, classes: List[int]):
+    while True:
+        frame = frame_q.get()
+        if frame is None:  # shutdown signal
+            break
+        try:
+            boxes = yolo_detect(frame, YOLO_CONF, YOLO_IMG_SZ, classes=classes)
+        except Exception as e:
+            boxes = []
+            if PRINT_DEBUG:
+                print("[YOLO worker] error:", repr(e))
+        # keep only latest
+        while not result_q.empty():
+            try: result_q.get_nowait()
+            except Exception: break
+        result_q.put(boxes)
+
+# --------------------- MAIN PIPELINE ---------------------
 def run_pipeline():
     init_db(DB_PATH)
 
     i_ped, i_veh, i_tl = pick_cameras()
 
-    # Smooth presets
+    # Cameras
     cam_ped = CameraStream(i_ped, FRAME_W, FRAME_H, FPS_TARGET)
     cam_veh = CameraStream(i_veh, FRAME_W, FRAME_H, FPS_TARGET)
     cam_tl  = CameraStream(i_tl,  480,     270,     max(8, FPS_TARGET // 2))
@@ -485,6 +490,7 @@ def run_pipeline():
     print(f"[Vehicle Cam]    {i_veh}")
     print(f"[Traffic Light]  {i_tl}")
 
+    # Wait for first frames (non-fatal)
     def wait_for_first_frame(stream: CameraStream, name: str, timeout_s: float = 3.0):
         t0 = time.time()
         while time.time() - t0 < timeout_s:
@@ -494,14 +500,21 @@ def run_pipeline():
             time.sleep(0.05)
         print(f"[WARN] {name} did not deliver first frame within {timeout_s:.1f}s")
         return False
-
     _ = wait_for_first_frame(cam_ped, "Pedestrian")
     _ = wait_for_first_frame(cam_veh, "Vehicle")
     _ = wait_for_first_frame(cam_tl,  "Traffic Light")
 
+    # Trackers and queues
     veh_tracker = CentroidTracker(max_dist_px=120.0, max_age_s=1.0)
+
+    ped_frames, ped_results = Queue(maxsize=1), Queue(maxsize=1)
+    veh_frames, veh_results = Queue(maxsize=1), Queue(maxsize=1)
+    threading.Thread(target=yolo_worker, args=(ped_frames, ped_results, COCO_PED), daemon=True).start()
+    threading.Thread(target=yolo_worker, args=(veh_frames, veh_results, COCO_VEH), daemon=True).start()
+
     frame_idx = 0
     last_log_ts = 0.0
+    last_status_ts = 0.0
 
     try:
         while True:
@@ -516,23 +529,30 @@ def run_pipeline():
             ok_ped = bool(rp and fp is not None)
             ok_veh = bool(rv and fv is not None)
             ok_tl  = bool(rt and ft is not None)
-            online = ok_ped or ok_veh or ok_tl  # any cam online
+            online = ok_ped or ok_veh or ok_tl
 
-            # Prepare blank frames for any missing cams (keeps MJPEG alive)
+            # blanks if missing
             blank_640x360 = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
             blank_480x270 = np.zeros((270, 480, 3), dtype=np.uint8)
-
             fp_s = fp if ok_ped else blank_640x360
             fv_s = fv if ok_veh else blank_640x360
             ft_s = ft if ok_tl  else blank_480x270
 
-            do_infer = (frame_idx % max(1, SKIP_FRAMES) == 0)
+            # enqueue latest frames for workers (respect SKIP_FRAMES)
+            if frame_idx % max(1, SKIP_FRAMES) == 0:
+                if ok_ped and ped_frames.empty():
+                    ped_frames.put(fp_s.copy())
+                if ok_veh and veh_frames.empty():
+                    veh_frames.put(fv_s.copy())
+
+            # get detections if available
+            det_p = ped_results.get_nowait() if not ped_results.empty() else []
+            det_v = veh_results.get_nowait() if not veh_results.empty() else []
 
             # --- Pedestrians ---
             ped_count = 0
-            if do_infer and ok_ped:
-                det_p = yolo_detect(fp_s, YOLO_CONF, YOLO_IMG_SZ)
-                det_p = filter_classes(det_p, PEDESTRIAN_CLASSES)
+            if ok_ped and det_p:
+                det_p = [(lab, bbox, cf) for (lab, bbox, cf) in det_p if lab in PEDESTRIAN_CLASSES]
                 ped_count = len(det_p)
                 for lab, (x1, y1, x2, y2), cf in det_p:
                     cv2.rectangle(fp_s, (x1, y1), (x2, y2), COLOR_GREEN, 2)
@@ -546,21 +566,20 @@ def run_pipeline():
             nearest_vehicle_distance_m = float('inf')
             avg_speed_mps = 0.0
 
-            if do_infer and ok_veh:
-                det_v = yolo_detect(fv_s, YOLO_CONF, YOLO_IMG_SZ)
-                det_v = filter_classes(det_v, VEHICLE_CLASSES)
+            if ok_veh and det_v:
+                det_v = [(lab, bbox, cf) for (lab, bbox, cf) in det_v if lab in VEHICLE_CLASSES]
                 veh_count = len(det_v)
-                now = time.time()
+                now_ts = time.time()
                 det_v_in = [(lab, bbox) for lab, bbox, _ in det_v]
-                veh_tracker.update(det_v_in, now)
+                veh_tracker.update(det_v_in, now_ts)
 
                 speed_by_tid = veh_tracker.speeds_mps(PIXELS_PER_METER_VEH)
 
                 for lab, (x1, y1, x2, y2), cf in det_v:
-                    # Draw box
+                    # Draw detected box
                     cv2.rectangle(fv_s, (x1, y1), (x2, y2), COLOR_RED, 2)
 
-                    # Match nearest active track (same class)
+                    # Find nearest active track for this det
                     bx = (x1 + x2) // 2
                     by = (y1 + y2) // 2
                     best_tid, best_d = None, 1e9
@@ -581,7 +600,7 @@ def run_pipeline():
                     nearest_vehicle_distance_m = min(nearest_vehicle_distance_m, dist_m)
                     cv2.line(fv_s, (cx, cy), (cx, PEDESTRIAN_LANE_Y), COLOR_YELLOW, 1)
 
-                    # Overlay label once (class, conf, speed, distance)
+                    # Overlay label (class, conf, speed, distance)
                     label_txt = f"{lab} {cf:.2f} | {speed_mps*3.6:.0f} km/h | {dist_m:.1f} m"
                     cv2.putText(fv_s, label_txt, (x1, max(12, y1 - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_RED, 1)
@@ -589,7 +608,7 @@ def run_pipeline():
                 if speed_by_tid:
                     avg_speed_mps = float(np.mean(list(speed_by_tid.values())))
 
-                # Draw track IDs / speeds at the track point
+                # Draw track IDs / speeds at track point
                 for tid, tr in veh_tracker.tracks.items():
                     if not tr.history:
                         continue
@@ -612,30 +631,32 @@ def run_pipeline():
             x, y, w, h = TRAFFIC_LIGHT_ROI
             cv2.rectangle(ft_s, (x, y), (x + w, y + h), COLOR_WHITE, 2)
 
-            # Push frames to web UI (even if some are blanks)
+            # Push frames to web UI
             publish_frame("ped", fp_s)
             publish_frame("veh", fv_s)
             publish_frame("tl",  ft_s)
 
-            # Prepare status → website
+            # Status → website (throttled)
             now = time.time()
-            local_hour = time.localtime(now).tm_hour
-            flags = {"night": local_hour >= 21, "rush": local_hour == 7}
-            extra = {"ambulance": False}
-
             nearest_m = 0.0 if nearest_vehicle_distance_m == float('inf') else nearest_vehicle_distance_m
-            publish_status_from_loop(
-                now_ts=now,
-                ped_count=ped_count,
-                veh_count=veh_count,
-                tl_color=tl_color,
-                nearest_m=nearest_m,
-                avg_mps=avg_speed_mps,
-                flags=flags,
-                extra=extra,
-            )
+            if now - last_status_ts >= STATUS_MIN_PERIOD:
+                local_hour = time.localtime(now).tm_hour
+                flags = {"night": local_hour >= 21, "rush": local_hour == 7}
+                extra = {"ambulance": False}
+                publish_status_from_loop(
+                    now_ts=now,
+                    ped_count=ped_count,
+                    veh_count=veh_count,
+                    tl_color=tl_color,
+                    nearest_m=nearest_m,
+                    avg_mps=avg_speed_mps,
+                    flags=flags,
+                    extra=extra,
+                    online=online,  # drives ONLINE/OFFLINE in UI
+                )
+                last_status_ts = now
 
-            # --- LED & Scenario Logic (simple local LED feedback) ---
+            # LED feedback (local)
             action = "OFF"
             veh_close = (nearest_vehicle_distance_m < VEHICLE_CLOSE_THRESH_M) if ok_veh else False
             if tl_color == "red":
@@ -645,20 +666,16 @@ def run_pipeline():
                     action = "STOP"
                 elif ped_count > 0:
                     action = "GO"
-                else:
-                    action = "OFF"
             elif tl_color == "yellow":
                 action = "STOP" if ped_count > 0 else "OFF"
-            else:  # unknown
+            else:
                 if ped_count > 0 and (veh_close or veh_count > 0):
                     action = "STOP"
                 elif ped_count > 0:
                     action = "GO"
-                else:
-                    action = "OFF"
             show_led(action)
 
-            # Overlays on vehicle frame for nearest/speed
+            # Overlay quick stats
             cv2.putText(
                 fv_s,
                 f"Nearest dist: {nearest_m:.1f} m",
@@ -667,7 +684,7 @@ def run_pipeline():
             cv2.putText(fv_s, f"Avg speed: {avg_speed_mps:.1f} m/s",
                         (8, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
 
-            # --- Logging (time-based, not per N frames) ---
+            # Logging (time-based)
             if now - last_log_ts >= LOG_EVERY_SEC:
                 log_event(DB_PATH, now, int(ped_count), int(veh_count),
                           tl_color, float(nearest_m), float(avg_speed_mps), action)
@@ -681,17 +698,19 @@ def run_pipeline():
                 if key == 27:
                     break
 
-            # pacing the outer loop
             elapsed = time.time() - loop_start
             if elapsed < FRAME_TIME:
                 time.sleep(FRAME_TIME - elapsed)
 
     finally:
-        try: cam_ped.stop()
+        # stop cams
+        for cam in (cam_ped, cam_veh, cam_tl):
+            try: cam.stop()
+            except Exception: pass
+        # stop workers
+        try: ped_frames.put(None)
         except Exception: pass
-        try: cam_veh.stop()
-        except Exception: pass
-        try: cam_tl.stop()
+        try: veh_frames.put(None)
         except Exception: pass
         if SHOW_WINDOWS:
             cv2.destroyAllWindows()
