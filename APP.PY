@@ -3,12 +3,12 @@
 from flask_app import publish_frame, publish_status_from_loop, start_http_server
 
 import os
+import re
 import cv2
 import time
 import math
 import sqlite3
 import threading
-import re
 from queue import Queue, Empty, Full
 from collections import deque
 from dataclasses import dataclass
@@ -36,10 +36,14 @@ Set via env:
 """
 
 # --------------------- CONFIGURATION ---------------------
+# --- Debug / resilience toggles ---
+FALLBACK_SYNC_AFTER_S = float(os.getenv("SC_FALLBACK_SYNC_AFTER_S", "0.6"))  # run a 1x sync detect if worker stale
+DISABLE_CLASS_FILTER  = os.getenv("SC_DISABLE_CLASS_FILTER", "0") == "1"     # set 1 to bypass classes= in predict()
+
 # YOLO
 YOLO_MODEL = os.getenv("SC_YOLO_MODEL", "yolov8n.pt")
-YOLO_CONF = float(os.getenv("SC_YOLO_CONF", "0.30"))
-YOLO_IMG_SZ = int(os.getenv("SC_YOLO_IMG", "416"))  # 416 runs much faster than 640 on CPU
+YOLO_CONF = float(os.getenv("SC_YOLO_CONF", "0.20"))  # lower to help detection in dim scenes
+YOLO_IMG_SZ = int(os.getenv("SC_YOLO_IMG", "416"))    # 416 runs much faster than 640 on CPU
 
 # Classes
 PEDESTRIAN_CLASSES = {"person"}
@@ -157,6 +161,7 @@ def _normalize_cam(value: Union[str, int, None]):
 def q_replace_latest(q: Queue, item):
     """Ensure worker always sees newest frame (no starvation)."""
     try:
+        # drain queue (keep only newest)
         while True:
             try:
                 q.get_nowait()
@@ -358,7 +363,7 @@ def yolo_detect(frame: np.ndarray, conf: float, img_size: int, classes=None):
         imgsz=img_size,
         verbose=False,
         max_det=50,
-        classes=classes,   # FAST: restrict classes inside predictor
+        classes=None if DISABLE_CLASS_FILTER else classes,   # toggle class filtering
     )
     boxes = []  # (label, (x1,y1,x2,y2), conf)
     r0 = res[0]
@@ -481,6 +486,7 @@ def yolo_worker(frame_q: Queue, result_q: Queue, classes: List[int]):
         frame = frame_q.get()
         if frame is None:  # shutdown signal
             break
+        t0 = time.time()
         try:
             boxes = yolo_detect(frame, YOLO_CONF, YOLO_IMG_SZ, classes=classes)
         except Exception as e:
@@ -492,6 +498,9 @@ def yolo_worker(frame_q: Queue, result_q: Queue, classes: List[int]):
             try: result_q.get_nowait()
             except Exception: break
         result_q.put(boxes)
+        if PRINT_DEBUG:
+            dt = (time.time() - t0) * 1000
+            print(f"[yolo] worker classes={classes} -> {len(boxes)} boxes in {dt:.0f} ms")
 
 # --------------------- MAIN PIPELINE ---------------------
 def run_pipeline():
@@ -530,6 +539,10 @@ def run_pipeline():
     threading.Thread(target=yolo_worker, args=(ped_frames, ped_results, COCO_PED), daemon=True).start()
     threading.Thread(target=yolo_worker, args=(veh_frames, veh_results, COCO_VEH), daemon=True).start()
 
+    # freshness timestamps for fallback
+    ped_last_result_ts = 0.0
+    veh_last_result_ts = 0.0
+
     frame_idx = 0
     last_log_ts = 0.0
     last_status_ts = 0.0
@@ -564,13 +577,37 @@ def run_pipeline():
                     q_replace_latest(veh_frames, fv_s.copy())
 
             # get detections if available (use most recent)
-            det_p = ped_results.get_nowait() if not ped_results.empty() else []
-            det_v = veh_results.get_nowait() if not veh_results.empty() else []
+            if not ped_results.empty():
+                det_p = ped_results.get_nowait()
+                ped_last_result_ts = time.time()
+            else:
+                det_p = []
+
+            if not veh_results.empty():
+                det_v = veh_results.get_nowait()
+                veh_last_result_ts = time.time()
+            else:
+                det_v = []
+
+            # fallback synchronous detect if worker stale
+            now_chk = time.time()
+            if ok_ped and (now_chk - ped_last_result_ts) > FALLBACK_SYNC_AFTER_S:
+                t0 = time.time()
+                det_p = yolo_detect(fp_s, YOLO_CONF, YOLO_IMG_SZ, classes=None if DISABLE_CLASS_FILTER else COCO_PED)
+                ped_last_result_ts = now_chk
+                if PRINT_DEBUG:
+                    print(f"[det-sync] ped -> {len(det_p)} boxes in {(time.time()-t0)*1000:.0f} ms")
+            if ok_veh and (now_chk - veh_last_result_ts) > FALLBACK_SYNC_AFTER_S:
+                t0 = time.time()
+                det_v = yolo_detect(fv_s, YOLO_CONF, YOLO_IMG_SZ, classes=None if DISABLE_CLASS_FILTER else COCO_VEH)
+                veh_last_result_ts = now_chk
+                if PRINT_DEBUG:
+                    print(f"[det-sync] veh -> {len(det_v)} boxes in {(time.time()-t0)*1000:.0f} ms")
 
             # --- Pedestrians ---
             ped_count = 0
             if ok_ped and det_p:
-                det_p = [(lab, bbox, cf) for (lab, bbox, cf) in det_p if lab in PEDESTRIAN_CLASSES]
+                det_p = [(lab, bbox, cf) for (lab, bbox, cf) in det_p if (lab in PEDESTRIAN_CLASSES) or DISABLE_CLASS_FILTER]
                 ped_count = len(det_p)
                 for lab, (x1, y1, x2, y2), cf in det_p:
                     cv2.rectangle(fp_s, (x1, y1), (x2, y2), COLOR_GREEN, 2)
@@ -585,7 +622,7 @@ def run_pipeline():
             avg_speed_mps = 0.0
 
             if ok_veh and det_v:
-                det_v = [(lab, bbox, cf) for (lab, bbox, cf) in det_v if lab in VEHICLE_CLASSES]
+                det_v = [(lab, bbox, cf) for (lab, bbox, cf) in det_v if (lab in VEHICLE_CLASSES) or DISABLE_CLASS_FILTER]
                 veh_count = len(det_v)
                 now_ts = time.time()
                 det_v_in = [(lab, bbox) for lab, bbox, _ in det_v]
@@ -707,6 +744,9 @@ def run_pipeline():
                 log_event(DB_PATH, now, int(ped_count), int(veh_count),
                           tl_color, float(nearest_m), float(avg_speed_mps), action)
                 last_log_ts = now
+
+            if PRINT_DEBUG and (frame_idx % 30 == 0):
+                print(f"[det] ped={ped_count} veh={veh_count} conf={YOLO_CONF} img={YOLO_IMG_SZ} class_filter={'off' if DISABLE_CLASS_FILTER else 'on'}")
 
             if SHOW_WINDOWS:
                 cv2.imshow("Pedestrians", fp_s)
