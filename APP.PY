@@ -44,7 +44,7 @@ VEHICLE_CLASSES = {"car", "truck", "bus", "motorbike", "bicycle"}
 # Frames (lighter for 3 cams)
 FRAME_W = int(os.getenv("SC_FRAME_W", "640"))
 FRAME_H = int(os.getenv("SC_FRAME_H", "360"))
-FPS_TARGET = int(os.getenv("SC_FPS", "12"))
+FPS_TARGET = int(os.getenv("SC_FPS", "20"))  # allow up to ~20 FPS target
 FRAME_TIME = 1.0 / max(1, FPS_TARGET)
 SKIP_FRAMES = int(os.getenv("SC_SKIP", "2"))  # infer every Nth frame (default 2)
 
@@ -74,7 +74,7 @@ HSV_GREEN  = ((40, 70, 70), (90, 255, 255))
 
 # Logging / DB
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
-LOG_EVERY_N_FRAMES = int(os.getenv("SC_LOG_EVERY", "5"))
+LOG_EVERY_SECONDS = float(os.getenv("SC_LOG_SEC", "30"))  # time-based logging (default 30s)
 
 # Drawing
 COLOR_GREEN  = (0, 255, 0)
@@ -140,7 +140,7 @@ class CameraStream:
 
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS,          min(self.fps, 12))
+        self.cap.set(cv2.CAP_PROP_FPS,          min(self.fps, 20))
 
         def set_fourcc(code):
             fourcc = cv2.VideoWriter_fourcc(*code)
@@ -289,7 +289,7 @@ class CentroidTracker:
 model = YOLO(YOLO_MODEL)
 
 def yolo_detect(frame: np.ndarray, conf: float, img_size: int):
-    res = model.predict(frame, conf=conf, imgsz=img_size, verbose=False)
+    res = model.predict(frame, conf=conf, imgsz=img_size, verbose=False, device='cpu')
     boxes = []  # (label, (x1,y1,x2,y2), conf)
     r0 = res[0]
     names = r0.names
@@ -378,7 +378,7 @@ def safe_camera(index: int) -> Optional[int]:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 6)
+        cap.set(cv2.CAP_PROP_FPS, 8)
         ok, _ = cap.read()
         cap.release()
         return index if ok else None
@@ -417,9 +417,9 @@ def run_pipeline():
     i_ped, i_veh, i_tl = pick_cameras()
 
     # Smooth presets
-    cam_ped = CameraStream(i_ped, 640, 360, 12)
-    cam_veh = CameraStream(i_veh, 640, 360, 12)
-    cam_tl  = CameraStream(i_tl,  480, 270,  8)
+    cam_ped = CameraStream(i_ped, 640, 360, 20)
+    cam_veh = CameraStream(i_veh, 640, 360, 20)
+    cam_tl  = CameraStream(i_tl,  480, 270, 12)
 
     print(f"[Pedestrian Cam] /dev/video{i_ped}")
     print(f"[Vehicle Cam]    /dev/video{i_veh}")
@@ -441,7 +441,7 @@ def run_pipeline():
 
     veh_tracker = CentroidTracker(max_dist_px=120.0, max_age_s=1.0)
     frame_idx = 0
-    last_log = 0
+    last_log_ts = 0.0
 
     try:
         while True:
@@ -452,8 +452,10 @@ def run_pipeline():
             rp, fp = cam_ped.read()
             rv, fv = cam_veh.read()
             rt, ft = cam_tl.read()
-            if not (rp and rv and rt) or fp is None or fv is None or ft is None:
-                print("[WARN] One or more cameras not providing frames.")
+
+            online = bool(rp and rv and rt and fp is not None and fv is not None and ft is not None)
+            if not online:
+                # Don't spin hot if cameras are down
                 time.sleep(0.05)
                 continue
 
@@ -478,7 +480,6 @@ def run_pipeline():
             nearest_vehicle_distance_m = float('inf')
             avg_speed_mps = 0.0
 
-            det_v_in = []
             if do_infer:
                 det_v = yolo_detect(fv_s, YOLO_CONF, YOLO_IMG_SZ)
                 det_v = filter_classes(det_v, VEHICLE_CLASSES)
@@ -487,32 +488,55 @@ def run_pipeline():
                 det_v_in = [(lab, bbox) for lab, bbox, _ in det_v]
                 veh_tracker.update(det_v_in, now)
 
-                # draw boxes
+                # speeds dictionary by track id
+                speed_by_tid = veh_tracker.speeds_mps(PIXELS_PER_METER_VEH)
+                # Build a helper: associate each track to the closest detection to annotate with bbox
+                # and compute per-vehicle distance to pedestrian lane
+                # (cx,cy) taken from tracker, match to nearest bbox center
                 for lab, (x1,y1,x2,y2), cf in det_v:
+                    # draw boxes first
                     cv2.rectangle(fv_s, (x1,y1), (x2,y2), COLOR_RED, 2)
-                    cv2.putText(fv_s, f"{lab} {cf:.2f}", (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_RED, 1)
-
-                # distance to pedestrian lane
-                for _, (x1,y1,x2,y2) in det_v_in:
+                    # vehicle "front" proxy: bottom center
                     cx = (x1 + x2) // 2
-                    cy = y2  # bottom of box as vehicle front proxy
+                    cy = y2
+                    # distance to pedestrian lane (vertical)
                     dy_px = max(0, PEDESTRIAN_LANE_Y - cy)
                     dist_m = abs(dy_px) / PIXELS_PER_METER_VEH
                     nearest_vehicle_distance_m = min(nearest_vehicle_distance_m, dist_m)
                     cv2.line(fv_s, (cx, cy), (cx, PEDESTRIAN_LANE_Y), COLOR_YELLOW, 1)
 
-                # speeds
-                sp = veh_tracker.speeds_mps(PIXELS_PER_METER_VEH)
-                if sp:
-                    avg_speed_mps = float(np.mean(list(sp.values())))
+                # For overlaying speed on each bbox, find nearest active track of same class
+                for lab, (x1,y1,x2,y2), cf in det_v:
+                    bx = (x1 + x2) // 2
+                    by = (y1 + y2) // 2
+                    best_tid, best_d = None, 1e9
+                    for tid, tr in veh_tracker.tracks.items():
+                        if tr.cls != lab or not tr.history:
+                            continue
+                        _, cx, cy = tr.history[-1]
+                        d = math.hypot(bx - cx, by - cy)
+                        if d < best_d:
+                            best_d, best_tid = d, tid
+                    speed_mps = speed_by_tid.get(best_tid, 0.0) if best_tid is not None else 0.0
+                    # per-vehicle distance again for overlay (bottom to lane)
+                    cx = (x1 + x2) // 2
+                    cy = y2
+                    dist_m = abs(max(0, PEDESTRIAN_LANE_Y - cy)) / PIXELS_PER_METER_VEH
+                    # overlay on box top
+                    label_txt = f"{lab} {cf:.2f} | {speed_mps*3.6:.0f} km/h | {dist_m:.1f} m"
+                    cv2.putText(fv_s, label_txt, (x1, max(12, y1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_RED, 1)
 
-                # draw track ids + speed
-                speeds = veh_tracker.speeds_mps(PIXELS_PER_METER_VEH)
+                # Average speed across tracked vehicles
+                if speed_by_tid:
+                    avg_speed_mps = float(np.mean(list(speed_by_tid.values())))
+
+                # draw track ids + speed dots
                 for tid, tr in veh_tracker.tracks.items():
                     if not tr.history:
                         continue
                     _, cx, cy = tr.history[-1]
-                    s = speeds.get(tid, 0.0)
+                    s = speed_by_tid.get(tid, 0.0)
                     cv2.circle(fv_s, (cx, cy), 3, COLOR_BLUE, -1)
                     cv2.putText(fv_s, f"ID {tid} {s:.1f} m/s", (cx+6, cy-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_BLUE, 1)
 
@@ -546,6 +570,7 @@ def run_pipeline():
                 avg_mps=avg_speed_mps,
                 flags=flags,
                 extra=extra,
+                online=online,  # NEW: signal system online/offline
             )
 
             # --- LED & Scenario Logic ---
@@ -581,11 +606,11 @@ def run_pipeline():
             )
             cv2.putText(fv_s, f"Avg speed: {avg_speed_mps:.1f} m/s", (8, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
 
-            # --- Logging ---
-            if frame_idx - last_log >= LOG_EVERY_N_FRAMES:
-                ts = time.time()
+            # --- Logging (time-based) ---
+            if (now - last_log_ts) >= LOG_EVERY_SECONDS:
+                ts = now
                 log_event(DB_PATH, ts, int(ped_count), int(veh_count), tl_color, float(nearest_m), float(avg_speed_mps), action)
-                last_log = frame_idx
+                last_log_ts = now
 
             if SHOW_WINDOWS:
                 cv2.imshow("Pedestrians", fp_s)
