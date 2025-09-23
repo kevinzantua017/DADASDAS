@@ -24,86 +24,65 @@ try:
 except Exception:
     pass
 
-# --------------------- FLAGS ---------------------
-SHOW_WINDOWS = False  # keep False on headless
+SHOW_WINDOWS = False
 PRINT_DEBUG = True
 
-"""
-Cameras: pass either numeric indices or device paths:
-  /dev/videoN  OR  /dev/v4l/by-id/usb-...-video-index0
-Set via env:
-  SC_CAM_PED, SC_CAM_VEH, SC_CAM_TL
-"""
-
-# --------------------- CONFIGURATION ---------------------
-# --- Debug / resilience toggles ---
-FALLBACK_SYNC_AFTER_S = float(os.getenv("SC_FALLBACK_SYNC_AFTER_S", "0.6"))  # run a 1x sync detect if worker stale
-DISABLE_CLASS_FILTER  = os.getenv("SC_DISABLE_CLASS_FILTER", "0") == "1"     # set 1 to bypass classes= in predict()
+# ---------- CONFIG ----------
+# Robustness / perf toggles
+FALLBACK_SYNC_AFTER_S = float(os.getenv("SC_FALLBACK_SYNC_AFTER_S", "0.6"))
+DISABLE_CLASS_FILTER  = os.getenv("SC_DISABLE_CLASS_FILTER", "0") == "1"
 
 # YOLO
-YOLO_MODEL = os.getenv("SC_YOLO_MODEL", "yolov8n.pt")
-YOLO_CONF = float(os.getenv("SC_YOLO_CONF", "0.20"))  # lower to help detection in dim scenes
-YOLO_IMG_SZ = int(os.getenv("SC_YOLO_IMG", "416"))    # 416 runs much faster than 640 on CPU
+YOLO_MODEL  = os.getenv("SC_YOLO_MODEL", "yolov8n.pt")
+YOLO_CONF   = float(os.getenv("SC_YOLO_CONF", "0.20"))
+YOLO_IMG_SZ = int(os.getenv("SC_YOLO_IMG", "416"))
 
-# Classes
+# Fast classes (COCO indices)
+COCO_PED = [0]                    # person
+COCO_VEH = [1, 2, 3, 5, 7]        # bicycle, car, motorcycle, bus, truck
+
+# Drawing classes (labels)
 PEDESTRIAN_CLASSES = {"person"}
-VEHICLE_CLASSES = {"car", "truck", "bus", "motorbike", "bicycle"}
+VEHICLE_CLASSES    = {"bicycle", "car", "motorbike", "bus", "truck"}
 
-# COCO indices for fast-class filtering at inference
-COCO_PED = [0]
-COCO_VEH = [1, 2, 3, 5, 7]
-
-# Frames (lighter for 3 cams)
+# Frames
 FRAME_W = int(os.getenv("SC_FRAME_W", "640"))
 FRAME_H = int(os.getenv("SC_FRAME_H", "360"))
 FPS_TARGET = int(os.getenv("SC_FPS", "15"))
 FRAME_TIME = 1.0 / max(1, FPS_TARGET)
-SKIP_FRAMES = int(os.getenv("SC_SKIP", "1"))  # infer every frame as requested
+SKIP_FRAMES = int(os.getenv("SC_SKIP", "1"))
 
-# Throttle JPEG encodes (HUGE win). Inference still runs every frame.
-PUBLISH_HZ = float(os.getenv("SC_PUBLISH_HZ", "10"))  # 10 fps publish to browser
+# Throttle JPEG encodes only (keeps inference at SKIP=1 smooth)
+PUBLISH_HZ = float(os.getenv("SC_PUBLISH_HZ", "10"))
 _last_pub = {"ped": 0.0, "veh": 0.0, "tl": 0.0}
 
-# LED matrix (guarded init below)
-LED_CASCADE = int(os.getenv("SC_LED_CASCADE", "4"))
-LED_ORIENTATION = int(os.getenv("SC_LED_ORIENTATION", "-90"))
-
-# Vehicle distance & speed calibration
+# Vehicle speed/distance calibration
 PIXELS_PER_METER_VEH = float(os.getenv("SC_VEH_PPM", "40.0"))
 MIN_TRACK_HITS = 3
 SPEED_AVG_WINDOW = 5
-
-# Pedestrian lane reference (in the vehicle camera frame)
 PEDESTRIAN_LANE_Y = int(os.getenv("SC_LANE_Y", "250"))
-
-# Safety threshold (meters)
 VEHICLE_CLOSE_THRESH_M = float(os.getenv("SC_VEH_CLOSE_M", "6.0"))
 
-# Traffic light ROI (x, y, w, h)
+# Traffic light ROI (x,y,w,h)
 TRAFFIC_LIGHT_ROI = tuple(map(int, os.getenv("SC_TL_ROI", "100,60,120,160").split(",")))
+HSV_RED_1 = ((0,120,120),(10,255,255))
+HSV_RED_2 = ((170,120,120),(180,255,255))
+HSV_YELLOW= ((15,120,120),(35,255,255))
+HSV_GREEN = ((40,70,70),(90,255,255))
 
-# HSV thresholds
-HSV_RED_1 = ((0, 120, 120), (10, 255, 255))
-HSV_RED_2 = ((170, 120, 120), (180, 255, 255))
-HSV_YELLOW = ((15, 120, 120), (35, 255, 255))
-HSV_GREEN  = ((40, 70, 70), (90, 255, 255))
-
-# Logging / DB
+# DB + status throttling
 DB_PATH = os.getenv("SC_DB", "smart_crosswalk.db")
 LOG_EVERY_SEC = int(os.getenv("SC_LOG_SEC", "30"))
+STATUS_MIN_PERIOD = float(os.getenv("SC_STATUS_PERIOD", "0.25"))
 
-# Drawing
-COLOR_GREEN  = (0, 255, 0)
-COLOR_RED    = (0, 0, 255)
-COLOR_YELLOW = (0, 255, 255)
-COLOR_WHITE  = (255, 255, 255)
-COLOR_BLUE   = (255, 0, 0)
+# Colors
+COLOR_GREEN  = (0,255,0)
+COLOR_RED    = (0,0,255)
+COLOR_YELLOW = (0,255,255)
+COLOR_WHITE  = (255,255,255)
+COLOR_BLUE   = (255,0,0)
 
-# Status throttle (reduce socket churn)
-STATUS_MIN_PERIOD = float(os.getenv("SC_STATUS_PERIOD", "0.25"))  # seconds, default 4Hz
-
-
-# --------------------- LED (guarded) ---------------------
+# ---------- LED ----------
 def _init_led():
     try:
         from luma.core.interface.serial import spi, noop
@@ -112,101 +91,74 @@ def _init_led():
         from PIL import ImageFont
 
         serial = spi(port=0, device=0, gpio=noop())
-        device = max7219(serial, cascaded=LED_CASCADE, block_orientation=LED_ORIENTATION, rotate=0)
+        device = max7219(serial, cascaded=int(os.getenv("SC_LED_CASCADE","4")),
+                         block_orientation=int(os.getenv("SC_LED_ORIENTATION","-90")), rotate=0)
         font = ImageFont.load_default()
 
         def show_led(msg: str):
             with canvas(device) as draw:
                 draw.text((1, -2), msg, fill="white", font=font)
-        if PRINT_DEBUG:
-            print("[LED] MAX7219 initialized")
+        if PRINT_DEBUG: print("[LED] MAX7219 initialized")
         return show_led
     except Exception as e:
-        if PRINT_DEBUG:
-            print("[LED] Not available, falling back to console:", repr(e))
-        def show_led(msg: str):
-            print("[LED]", msg)
-        return show_led
+        if PRINT_DEBUG: print("[LED] Fallback console:", repr(e))
+        return lambda msg: print("[LED]", msg)
 
 show_led = _init_led()
 
-# --------------------- HELPERS ---------------------
-def _normalize_cam(value: Union[str, int, None]):
-    """
-    Accepts int, numeric string, /dev/videoN, or /dev/v4l/by-id/*.
-    Returns an int /dev/videoN if resolvable, else the original string/path.
-    """
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
+# ---------- UTIL ----------
+def _normalize_cam(value: Union[str,int,None]):
+    if value is None: return None
+    if isinstance(value,int): return value
     s = str(value).strip()
-    if s.isdigit():
-        return int(s)
+    if s.isdigit(): return int(s)
     try:
         if s.startswith("/dev/"):
-            real = os.path.realpath(s)  # follows by-id symlinks
+            real = os.path.realpath(s)
             m = re.match(r"^/dev/video(\d+)$", real)
-            if m:
-                return int(m.group(1))
-            if os.path.exists(real):
-                return real
-    except Exception:
-        pass
+            if m: return int(m.group(1))
+            if os.path.exists(real): return real
+    except Exception: pass
     m = re.match(r"^/dev/video(\d+)$", s)
-    if m:
-        return int(m.group(1))
-    return s
+    return int(m.group(1)) if m else s
 
 def q_replace_latest(q: Queue, item):
-    """Ensure worker always sees newest frame (no starvation)."""
     try:
-        # drain queue (keep only newest)
         while True:
-            try:
-                q.get_nowait()
-            except Empty:
-                break
+            try: q.get_nowait()
+            except Empty: break
         q.put_nowait(item)
     except Full:
         pass
 
 def publish_frame_throttled(key: str, frame: np.ndarray):
     now = time.time()
-    if now - _last_pub.get(key, 0.0) >= (1.0 / max(1.0, PUBLISH_HZ)):
+    if now - _last_pub.get(key,0.0) >= (1.0/max(1.0,PUBLISH_HZ)):
         publish_frame(key, frame)
         _last_pub[key] = now
 
-# --------------------- CAMERA THREAD ---------------------
+# ---------- CAMERA ----------
 class CameraStream:
-    def __init__(self, index: Union[int, str], width: int, height: int, fps: int):
-        self.index = index
-        self.width = width
-        self.height = height
-        self.fps = fps
+    def __init__(self, index, width, height, fps):
+        self.index, self.width, self.height, self.fps = index, width, height, fps
         self.lock = threading.Lock()
         self.frame = None
         self.ret = False
         self.stopped = False
         self._open_camera()
-        self.thread = threading.Thread(target=self._update, daemon=True)
-        self.thread.start()
+        threading.Thread(target=self._update, daemon=True).start()
 
     def _open_camera(self):
         idx = _normalize_cam(self.index)
-        if isinstance(idx, int):
+        if isinstance(idx,int):
             self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
-            if not self.cap.isOpened():
-                raise RuntimeError(f"Could not open camera index {idx}")
+            if not self.cap.isOpened(): self.cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
+            if not self.cap.isOpened(): raise RuntimeError(f"Could not open camera index {idx}")
             pretty = f"/dev/video{idx}"
         else:
             self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
-            if not self.cap.isOpened():
-                raise RuntimeError(f"Could not open camera path {idx}")
+            if not self.cap.isOpened(): self.cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
+            if not self.cap.isOpened(): raise RuntimeError(f"Could not open camera path {idx}")
             pretty = str(idx)
 
         try: self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -214,24 +166,23 @@ class CameraStream:
 
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS,          min(self.fps, 20))
+        self.cap.set(cv2.CAP_PROP_FPS, min(self.fps, 20))
 
         def set_fourcc(code):
-            fourcc = cv2.VideoWriter_fourcc(*code)
-            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-            return int(self.cap.get(cv2.CAP_PROP_FOURCC)) == fourcc
-
+            f = cv2.VideoWriter_fourcc(*code)
+            self.cap.set(cv2.CAP_PROP_FOURCC, f)
+            return int(self.cap.get(cv2.CAP_PROP_FOURCC)) == f
         if not set_fourcc('MJPG'):
             set_fourcc('YUYV') or set_fourcc('YUY2')
 
-        self.cap.read()  # warm-up
+        self.cap.read()
 
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         f = self.cap.get(cv2.CAP_PROP_FPS)
-        fourcc_val = int(self.cap.get(cv2.CAP_PROP_FOURCC))
-        fourcc_str = "".join([chr((fourcc_val >> 8*i) & 0xFF) for i in range(4)])
-        print(f"[OPEN] {pretty} -> {w}x{h}@{f:.1f} FOURCC={fourcc_str}")
+        four = int(self.cap.get(cv2.CAP_PROP_FOURCC))
+        four_s = "".join([chr((four >> 8*i) & 0xFF) for i in range(4)])
+        print(f"[OPEN] {pretty} -> {w}x{h}@{f:.1f} FOURCC={four_s}")
 
     def _reopen_once(self):
         try: self.cap.release()
@@ -241,7 +192,7 @@ class CameraStream:
 
     def _update(self):
         no_frame = 0
-        frame_interval = 1.0 / max(1, self.fps)
+        frame_interval = 1.0 / max(1,self.fps)
         last_t = 0.0
         while not self.stopped:
             ret, frame = self.cap.read()
@@ -253,134 +204,113 @@ class CameraStream:
                     no_frame = 0
                 time.sleep(0.02)
                 continue
-            else:
-                no_frame = 0
-
             if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
-
+                frame = cv2.resize(frame, (self.width,self.height), interpolation=cv2.INTER_AREA)
             with self.lock:
-                self.ret = True
-                self.frame = frame
-
+                self.ret, self.frame = True, frame
             now = time.time()
             sleep_left = frame_interval - (now - last_t)
-            if sleep_left > 0:
-                time.sleep(sleep_left)
+            if sleep_left > 0: time.sleep(sleep_left)
             last_t = now
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def read(self):
         with self.lock:
             return self.ret, None if self.frame is None else self.frame.copy()
 
     def stop(self):
         self.stopped = True
-        try: self.thread.join(timeout=1.0)
-        except Exception: pass
         try: self.cap.release()
         except Exception: pass
 
-# --------------------- SIMPLE TRACKER ---------------------
+# ---------- TRACKER ----------
 @dataclass
 class Track:
     id: int
     cls: str
-    history: deque  # of (t, cx, cy)
+    history: deque
     hits: int = 0
 
 class CentroidTracker:
-    def __init__(self, max_dist_px: float = 100.0, max_age_s: float = 1.0):
+    def __init__(self, max_dist_px=120.0, max_age_s=1.0):
         self.next_id = 1
         self.tracks: Dict[int, Track] = {}
         self.max_dist = max_dist_px
         self.max_age = max_age_s
 
-    def update(self, detections: List[Tuple[str, Tuple[int,int,int,int]]], now: float):
+    def update(self, detections, now):
         det_centroids = [(lab, ((x1+x2)//2, (y1+y2))) for lab,(x1,y1,x2,y2) in detections]
-
         unmatched = list(range(len(det_centroids)))
+
         for tid, tr in list(self.tracks.items()):
             best_j, best_d = None, 1e9
-            _, (last_t, last_cx, last_cy) = tr.cls, tr.history[-1]
+            _, (lt, lx, ly) = tr.cls, tr.history[-1]
             for j in unmatched:
-                lab, (cx, cy) = det_centroids[j]
-                if lab != tr.cls:
-                    continue
-                d = math.hypot(cx - last_cx, cy - last_cy)
-                if d < best_d:
-                    best_d, best_j = d, j
+                lab,(cx,cy) = det_centroids[j]
+                if lab != tr.cls: continue
+                d = math.hypot(cx-lx, cy-ly)
+                if d < best_d: best_d, best_j = d, j
             if best_j is not None and best_d <= self.max_dist:
-                lab, (cx, cy) = det_centroids[best_j]
-                tr.history.append((now, cx, cy))
+                lab,(cx,cy) = det_centroids[best_j]
+                tr.history.append((now,cx,cy))
                 tr.hits += 1
-                if len(tr.history) > 30:
-                    tr.history.popleft()
+                if len(tr.history)>30: tr.history.popleft()
                 unmatched.remove(best_j)
 
         for j in unmatched:
-            lab, (cx, cy) = det_centroids[j]
+            lab,(cx,cy) = det_centroids[j]
             tr = Track(id=self.next_id, cls=lab, history=deque(maxlen=30))
-            tr.history.append((now, cx, cy))
+            tr.history.append((now,cx,cy))
             tr.hits = 1
             self.tracks[tr.id] = tr
             self.next_id += 1
 
         to_del = []
-        for tid, tr in self.tracks.items():
-            last_t, _, _ = tr.history[-1]
-            if now - last_t > self.max_age:
-                to_del.append(tid)
-        for tid in to_del:
-            self.tracks.pop(tid, None)
+        for tid,tr in self.tracks.items():
+            last_t,_,_ = tr.history[-1]
+            if now - last_t > self.max_age: to_del.append(tid)
+        for tid in to_del: self.tracks.pop(tid,None)
 
-    def speeds_mps(self, ppm: float) -> Dict[int, float]:
+    def speeds_mps(self, ppm):
         out = {}
-        for tid, tr in self.tracks.items():
-            if tr.hits < MIN_TRACK_HITS or len(tr.history) < 2:
-                continue
+        for tid,tr in self.tracks.items():
+            if tr.hits < MIN_TRACK_HITS or len(tr.history)<2: continue
             pts = list(tr.history)[-SPEED_AVG_WINDOW:]
-            ds, dt = 0.0, 0.0
-            for (t1, x1, y1), (t2, x2, y2) in zip(pts, pts[1:]):
-                ds += math.hypot(x2 - x1, y2 - y1)
-                dt += (t2 - t1)
-            if dt <= 0:
-                continue
-            m = (ds / ppm) / dt
-            out[tid] = m
+            ds,dt = 0.0,0.0
+            for (t1,x1,y1),(t2,x2,y2) in zip(pts,pts[1:]):
+                ds += math.hypot(x2-x1,y2-y1)
+                dt += (t2-t1)
+            if dt<=0: continue
+            out[tid] = (ds/ppm)/dt
         return out
 
-# --------------------- YOLO ---------------------
+# ---------- YOLO ----------
 model = YOLO(YOLO_MODEL)
-try:
-    model.fuse()  # fuse Conv+BN for speed
-except Exception:
-    pass
+try: model.fuse()
+except Exception: pass
 
-def yolo_detect(frame: np.ndarray, conf: float, img_size: int, classes=None):
+def yolo_detect(frame, conf, img_size, classes=None):
     res = model.predict(
         frame,
         conf=conf,
         imgsz=img_size,
         verbose=False,
         max_det=50,
-        classes=None if DISABLE_CLASS_FILTER else classes,   # toggle class filtering
+        classes=None if DISABLE_CLASS_FILTER else classes
     )
-    boxes = []  # (label, (x1,y1,x2,y2), conf)
+    boxes=[]
     r0 = res[0]
     names = r0.names
     for b in r0.boxes:
         cls_id = int(b.cls[0])
         label = names[cls_id].lower()
-        x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-        boxes.append((label, (x1, y1, x2, y2), float(b.conf[0])))
+        x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
+        boxes.append((label,(x1,y1,x2,y2), float(b.conf[0])))
     return boxes
 
-# --------------------- DB ---------------------
-def init_db(path: str):
-    con = sqlite3.connect(path)
-    cur = con.cursor()
-    cur.execute(
-        """
+# ---------- DB ----------
+def init_db(path):
+    con = sqlite3.connect(path); cur = con.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts REAL NOT NULL,
@@ -391,157 +321,119 @@ def init_db(path: str):
             avg_vehicle_speed_mps REAL,
             action TEXT
         );
-        """
-    )
-    con.commit()
-    con.close()
+    """)
+    con.commit(); con.close()
 
-def log_event(path: str, ts: float, ped_count: int, veh_count: int, tl_color: str,
-              nearest_vehicle_distance_m: float, avg_vehicle_speed_mps: float, action: str):
-    con = sqlite3.connect(path)
-    cur = con.cursor()
+def log_event(path, ts, ped_count, veh_count, tl_color, nearest_m, avg_mps, action):
+    con = sqlite3.connect(path); cur = con.cursor()
     cur.execute(
-        "INSERT INTO events (ts, ped_count, veh_count, tl_color, nearest_vehicle_distance_m, avg_vehicle_speed_mps, action) VALUES (?,?,?,?,?,?,?)",
-        (ts, ped_count, veh_count, tl_color, nearest_vehicle_distance_m, avg_vehicle_speed_mps, action)
+        "INSERT INTO events (ts,ped_count,veh_count,tl_color,nearest_vehicle_distance_m,avg_vehicle_speed_mps,action) VALUES (?,?,?,?,?,?,?)",
+        (ts, ped_count, veh_count, tl_color, nearest_m, avg_mps, action)
     )
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
-# --------------------- TRAFFIC LIGHT DETECTION ---------------------
-def detect_traffic_light_color(frame: np.ndarray) -> str:
-    x, y, w, h = TRAFFIC_LIGHT_ROI
+# ---------- TL DETECTION ----------
+def detect_traffic_light_color(frame):
+    x,y,w,h = TRAFFIC_LIGHT_ROI
     roi = frame[y:y+h, x:x+w]
-    if roi.size == 0:
-        return "unknown"
+    if roi.size==0: return "unknown"
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    def mask_range(hsv_img, lo, hi):
-        lo = np.array(lo, dtype=np.uint8)
-        hi = np.array(hi, dtype=np.uint8)
-        return cv2.inRange(hsv_img, lo, hi)
+    def mask(hsv_img, lo, hi):
+        return cv2.inRange(hsv_img, np.array(lo,np.uint8), np.array(hi,np.uint8))
 
-    mask_r1 = mask_range(hsv, *HSV_RED_1)
-    mask_r2 = mask_range(hsv, *HSV_RED_2)
-    mask_red = cv2.bitwise_or(mask_r1, mask_r2)
-    mask_y = mask_range(hsv, *HSV_YELLOW)
-    mask_g = mask_range(hsv, *HSV_GREEN)
+    mask_red = cv2.bitwise_or(mask(hsv,*HSV_RED_1), mask(hsv,*HSV_RED_2))
+    mask_y   = mask(hsv,*HSV_YELLOW)
+    mask_g   = mask(hsv,*HSV_GREEN)
 
-    r = int(np.sum(mask_red > 0))
-    yv = int(np.sum(mask_y > 0))
-    g = int(np.sum(mask_g > 0))
+    r = int(np.sum(mask_red>0))
+    yv= int(np.sum(mask_y>0))
+    g = int(np.sum(mask_g>0))
+    vals={"red":r,"yellow":yv,"green":g}
+    best=max(vals,key=vals.get)
+    return best if vals[best]>=50 else "unknown"
 
-    vals = {"red": r, "yellow": yv, "green": g}
-    best = max(vals, key=vals.get)
-    if vals[best] < 50:
-        return "unknown"
-    return best
-
-# --------------------- CAMERA PICKING ---------------------
-def safe_camera(index) -> Optional[int | str]:
-    idx = _normalize_cam(index)
+# ---------- CAM PICK ----------
+def safe_camera(idx):
+    x = _normalize_cam(idx)
     try:
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
-        if not cap.isOpened():
-            return None
+        cap = cv2.VideoCapture(x, cv2.CAP_V4L2)
+        if not cap.isOpened(): cap = cv2.VideoCapture(x, cv2.CAP_ANY)
+        if not cap.isOpened(): return None
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 6)
-        ok, _ = cap.read()
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
+        cap.set(cv2.CAP_PROP_FPS,6)
+        ok,_ = cap.read()
         cap.release()
-        return idx if ok else None
+        return x if ok else None
     except Exception:
         return None
 
 def pick_cameras():
-    ped_env = os.getenv("SC_CAM_PED")
-    veh_env = os.getenv("SC_CAM_VEH")
-    tl_env  = os.getenv("SC_CAM_TL")
-
+    ped_env, veh_env, tl_env = os.getenv("SC_CAM_PED"), os.getenv("SC_CAM_VEH"), os.getenv("SC_CAM_TL")
     if ped_env and veh_env and tl_env:
-        ped = _normalize_cam(ped_env)
-        veh = _normalize_cam(veh_env)
-        tl  = _normalize_cam(tl_env)
-        ok_all = [safe_camera(ped), safe_camera(veh), safe_camera(tl)]
-        if all(x is not None for x in ok_all):
-            return ped, veh, tl
-        raise RuntimeError(f"One or more SC_CAM_* env cameras failed to open: {ok_all}")
+        ped,veh,tl = _normalize_cam(ped_env), _normalize_cam(veh_env), _normalize_cam(tl_env)
+        ok = [safe_camera(ped), safe_camera(veh), safe_camera(tl)]
+        if all(o is not None for o in ok): return ped,veh,tl
+        raise RuntimeError(f"SC_CAM_* failed: {ok}")
 
-    candidates = []
-    for idx in range(10):
-        ok = safe_camera(idx)
-        if ok is not None:
-            candidates.append(ok)
-        if len(candidates) >= 3:
-            break
-    if len(candidates) < 3:
-        raise RuntimeError(f"Found only {len(candidates)} working cameras: {candidates}.")
-    return candidates[0], candidates[1], candidates[2]
+    found=[]
+    for i in range(10):
+        ok = safe_camera(i)
+        if ok is not None: found.append(ok)
+        if len(found)>=3: break
+    if len(found)<3: raise RuntimeError(f"Found only {len(found)} working cams: {found}")
+    return found[0], found[1], found[2]
 
-# --------------------- YOLO WORKERS ---------------------
+# ---------- YOLO WORKERS ----------
 def yolo_worker(frame_q: Queue, result_q: Queue, classes: List[int]):
     while True:
         frame = frame_q.get()
-        if frame is None:  # shutdown signal
-            break
-        t0 = time.time()
+        if frame is None: break
         try:
             boxes = yolo_detect(frame, YOLO_CONF, YOLO_IMG_SZ, classes=classes)
         except Exception as e:
             boxes = []
-            if PRINT_DEBUG:
-                print("[YOLO worker] error:", repr(e))
-        # keep only latest
+            if PRINT_DEBUG: print("[YOLO worker err]", repr(e))
         while not result_q.empty():
             try: result_q.get_nowait()
             except Exception: break
         result_q.put(boxes)
-        if PRINT_DEBUG:
-            dt = (time.time() - t0) * 1000
-            print(f"[yolo] worker classes={classes} -> {len(boxes)} boxes in {dt:.0f} ms")
 
-# --------------------- MAIN PIPELINE ---------------------
+# ---------- PIPELINE ----------
 def run_pipeline():
     init_db(DB_PATH)
 
     i_ped, i_veh, i_tl = pick_cameras()
-
-    # Cameras
     cam_ped = CameraStream(i_ped, FRAME_W, FRAME_H, FPS_TARGET)
     cam_veh = CameraStream(i_veh, FRAME_W, FRAME_H, FPS_TARGET)
-    cam_tl  = CameraStream(i_tl,  480,     270,     max(8, FPS_TARGET // 2))
-
+    cam_tl  = CameraStream(i_tl,  480,     270,     max(8, FPS_TARGET//2))
     print(f"[Pedestrian Cam] {i_ped}")
     print(f"[Vehicle Cam]    {i_veh}")
     print(f"[Traffic Light]  {i_tl}")
 
-    # Wait for first frames (non-fatal)
-    def wait_for_first_frame(stream: CameraStream, name: str, timeout_s: float = 3.0):
-        t0 = time.time()
-        while time.time() - t0 < timeout_s:
-            ok, fr = stream.read()
-            if ok and fr is not None:
-                return True
+    # Wait first frame (non-fatal)
+    def wait_first(c,n, t=3.0):
+        t0=time.time()
+        while time.time()-t0<t:
+            ok,fr=c.read()
+            if ok and fr is not None: return True
             time.sleep(0.05)
-        print(f"[WARN] {name} did not deliver first frame within {timeout_s:.1f}s")
-        return False
-    _ = wait_for_first_frame(cam_ped, "Pedestrian")
-    _ = wait_for_first_frame(cam_veh, "Vehicle")
-    _ = wait_for_first_frame(cam_tl,  "Traffic Light")
+        print(f"[WARN] {n} first frame timeout"); return False
+    wait_first(cam_ped,"Ped")
+    wait_first(cam_veh,"Veh")
+    wait_first(cam_tl,"TL")
 
-    # Trackers and queues
-    veh_tracker = CentroidTracker(max_dist_px=120.0, max_age_s=1.0)
-
+    # Queues/workers
     ped_frames, ped_results = Queue(maxsize=1), Queue(maxsize=1)
     veh_frames, veh_results = Queue(maxsize=1), Queue(maxsize=1)
-    threading.Thread(target=yolo_worker, args=(ped_frames, ped_results, COCO_PED), daemon=True).start()
-    threading.Thread(target=yolo_worker, args=(veh_frames, veh_results, COCO_VEH), daemon=True).start()
+    threading.Thread(target=yolo_worker, args=(ped_frames,ped_results,COCO_PED), daemon=True).start()
+    threading.Thread(target=yolo_worker, args=(veh_frames,veh_results,COCO_VEH), daemon=True).start()
 
-    # freshness timestamps for fallback
-    ped_last_result_ts = 0.0
-    veh_last_result_ts = 0.0
+    ped_last_ts = 0.0
+    veh_last_ts = 0.0
+    veh_tracker = CentroidTracker()
 
     frame_idx = 0
     last_log_ts = 0.0
@@ -552,7 +444,6 @@ def run_pipeline():
             loop_start = time.time()
             frame_idx += 1
 
-            # Read cameras
             rp, fp = cam_ped.read()
             rv, fv = cam_veh.read()
             rt, ft = cam_tl.read()
@@ -562,141 +453,103 @@ def run_pipeline():
             ok_tl  = bool(rt and ft is not None)
             online = ok_ped or ok_veh or ok_tl
 
-            # blanks if missing
             blank_640x360 = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
             blank_480x270 = np.zeros((270, 480, 3), dtype=np.uint8)
             fp_s = fp if ok_ped else blank_640x360
             fv_s = fv if ok_veh else blank_640x360
             ft_s = ft if ok_tl  else blank_480x270
 
-            # enqueue latest frames ALWAYS (replace-latest); respect SKIP_FRAMES
-            if frame_idx % max(1, SKIP_FRAMES) == 0:
-                if ok_ped:
-                    q_replace_latest(ped_frames, fp_s.copy())
-                if ok_veh:
-                    q_replace_latest(veh_frames, fv_s.copy())
+            # enqueue latest frames at SKIP cadence
+            if frame_idx % max(1,SKIP_FRAMES)==0:
+                if ok_ped: q_replace_latest(ped_frames, fp_s.copy())
+                if ok_veh: q_replace_latest(veh_frames, fv_s.copy())
 
-            # get detections if available (use most recent)
-            if not ped_results.empty():
-                det_p = ped_results.get_nowait()
-                ped_last_result_ts = time.time()
-            else:
-                det_p = []
+            # pull results if available
+            det_p = ped_results.get_nowait() if not ped_results.empty() else []
+            if det_p: ped_last_ts = time.time()
+            det_v = veh_results.get_nowait() if not veh_results.empty() else []
+            if det_v: veh_last_ts = time.time()
 
-            if not veh_results.empty():
-                det_v = veh_results.get_nowait()
-                veh_last_result_ts = time.time()
-            else:
-                det_v = []
-
-            # fallback synchronous detect if worker stale
+            # fallback sync detect if worker stale
             now_chk = time.time()
-            if ok_ped and (now_chk - ped_last_result_ts) > FALLBACK_SYNC_AFTER_S:
-                t0 = time.time()
+            if ok_ped and (now_chk - ped_last_ts) > FALLBACK_SYNC_AFTER_S:
                 det_p = yolo_detect(fp_s, YOLO_CONF, YOLO_IMG_SZ, classes=None if DISABLE_CLASS_FILTER else COCO_PED)
-                ped_last_result_ts = now_chk
-                if PRINT_DEBUG:
-                    print(f"[det-sync] ped -> {len(det_p)} boxes in {(time.time()-t0)*1000:.0f} ms")
-            if ok_veh and (now_chk - veh_last_result_ts) > FALLBACK_SYNC_AFTER_S:
-                t0 = time.time()
+                ped_last_ts = now_chk
+            if ok_veh and (now_chk - veh_last_ts) > FALLBACK_SYNC_AFTER_S:
                 det_v = yolo_detect(fv_s, YOLO_CONF, YOLO_IMG_SZ, classes=None if DISABLE_CLASS_FILTER else COCO_VEH)
-                veh_last_result_ts = now_chk
-                if PRINT_DEBUG:
-                    print(f"[det-sync] veh -> {len(det_v)} boxes in {(time.time()-t0)*1000:.0f} ms")
+                veh_last_ts = now_chk
 
-            # --- Pedestrians ---
+            # ---- Pedestrians ----
             ped_count = 0
             if ok_ped and det_p:
-                det_p = [(lab, bbox, cf) for (lab, bbox, cf) in det_p if (lab in PEDESTRIAN_CLASSES) or DISABLE_CLASS_FILTER]
+                det_p = [(lab,b,cf) for (lab,b,cf) in det_p if (lab in PEDESTRIAN_CLASSES) or DISABLE_CLASS_FILTER]
                 ped_count = len(det_p)
-                for lab, (x1, y1, x2, y2), cf in det_p:
-                    cv2.rectangle(fp_s, (x1, y1), (x2, y2), COLOR_GREEN, 2)
-                    cv2.putText(fp_s, f"{lab} {cf:.2f}", (x1, y1 - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_GREEN, 1)
-            cv2.putText(fp_s, f"Pedestrians: {ped_count}",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
+                for lab,(x1,y1,x2,y2),cf in det_p:
+                    cv2.rectangle(fp_s,(x1,y1),(x2,y2),COLOR_GREEN,2)
+                    cv2.putText(fp_s,f"{lab} {cf:.2f}",(x1,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.45,COLOR_GREEN,1)
+            cv2.putText(fp_s,f"Pedestrians: {ped_count}",(8,20),cv2.FONT_HERSHEY_SIMPLEX,0.6,COLOR_WHITE,2)
 
-            # --- Vehicles ---
+            # ---- Vehicles ----
             veh_count = 0
             nearest_vehicle_distance_m = float('inf')
             avg_speed_mps = 0.0
 
             if ok_veh and det_v:
-                det_v = [(lab, bbox, cf) for (lab, bbox, cf) in det_v if (lab in VEHICLE_CLASSES) or DISABLE_CLASS_FILTER]
+                det_v = [(lab,b,cf) for (lab,b,cf) in det_v if (lab in VEHICLE_CLASSES) or DISABLE_CLASS_FILTER]
                 veh_count = len(det_v)
-                now_ts = time.time()
-                det_v_in = [(lab, bbox) for lab, bbox, _ in det_v]
-                veh_tracker.update(det_v_in, now_ts)
 
+                now_ts = time.time()
+                veh_tracker.update([(lab,b) for lab,b,_ in det_v], now_ts)
                 speed_by_tid = veh_tracker.speeds_mps(PIXELS_PER_METER_VEH)
 
-                for lab, (x1, y1, x2, y2), cf in det_v:
-                    # Draw detected box
-                    cv2.rectangle(fv_s, (x1, y1), (x2, y2), COLOR_RED, 2)
+                for lab,(x1,y1,x2,y2),cf in det_v:
+                    cv2.rectangle(fv_s,(x1,y1),(x2,y2),COLOR_RED,2)
+                    bx,by = (x1+x2)//2, (y1+y2)//2
+                    best_tid,best_d = None,1e9
+                    for tid,tr in veh_tracker.tracks.items():
+                        if tr.cls != lab or not tr.history: continue
+                        _,cx,cy = tr.history[-1]
+                        d = math.hypot(bx-cx, by-cy)
+                        if d<best_d: best_d,best_tid = d,tid
+                    speed_mps = speed_by_tid.get(best_tid,0.0) if best_tid is not None else 0.0
 
-                    # Find nearest active track for this det
-                    bx = (x1 + x2) // 2
-                    by = (y1 + y2) // 2
-                    best_tid, best_d = None, 1e9
-                    for tid, tr in veh_tracker.tracks.items():
-                        if tr.cls != lab or not tr.history:
-                            continue
-                        _, cx_tr, cy_tr = tr.history[-1]
-                        d = math.hypot(bx - cx_tr, by - cy_tr)
-                        if d < best_d:
-                            best_d, best_tid = d, tid
-                    speed_mps = speed_by_tid.get(best_tid, 0.0) if best_tid is not None else 0.0
-
-                    # Distance to pedestrian lane
-                    cx = (x1 + x2) // 2
-                    cy = y2  # vehicle "front" proxy
-                    dy_px = max(0, PEDESTRIAN_LANE_Y - cy)
-                    dist_m = abs(dy_px) / PIXELS_PER_METER_VEH
+                    cx,cy = (x1+x2)//2, y2
+                    dy_px  = max(0, PEDESTRIAN_LANE_Y - cy)
+                    dist_m = abs(dy_px)/PIXELS_PER_METER_VEH
                     nearest_vehicle_distance_m = min(nearest_vehicle_distance_m, dist_m)
-                    cv2.line(fv_s, (cx, cy), (cx, PEDESTRIAN_LANE_Y), COLOR_YELLOW, 1)
+                    cv2.line(fv_s,(cx,cy),(cx,PEDESTRIAN_LANE_Y),COLOR_YELLOW,1)
 
-                    # Overlay label (class, conf, speed, distance)
-                    label_txt = f"{lab} {cf:.2f} | {speed_mps*3.6:.0f} km/h | {dist_m:.1f} m"
-                    cv2.putText(fv_s, label_txt, (x1, max(12, y1 - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_RED, 1)
+                    label = f"{lab} {cf:.2f} | {speed_mps*3.6:.0f} km/h | {dist_m:.1f} m"
+                    cv2.putText(fv_s,label,(x1,max(12,y1-6)),cv2.FONT_HERSHEY_SIMPLEX,0.45,COLOR_RED,1)
 
-                if speed_by_tid:
-                    avg_speed_mps = float(np.mean(list(speed_by_tid.values())))
+                if speed_by_tid: avg_speed_mps = float(np.mean(list(speed_by_tid.values())))
 
-                # Draw track IDs / speeds at track point
-                for tid, tr in veh_tracker.tracks.items():
-                    if not tr.history:
-                        continue
-                    _, cx_t, cy_t = tr.history[-1]
-                    s = speed_by_tid.get(tid, 0.0)
-                    cv2.circle(fv_s, (cx_t, cy_t), 3, COLOR_BLUE, -1)
-                    cv2.putText(fv_s, f"ID {tid} {s:.1f} m/s",
-                                (cx_t + 6, cy_t - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_BLUE, 1)
+                for tid,tr in veh_tracker.tracks.items():
+                    if not tr.history: continue
+                    _,cx,cy = tr.history[-1]
+                    s = speed_by_tid.get(tid,0.0)
+                    cv2.circle(fv_s,(cx,cy),3,COLOR_BLUE,-1)
+                    cv2.putText(fv_s,f"ID {tid} {s:.1f} m/s",(cx+6,cy-6),cv2.FONT_HERSHEY_SIMPLEX,0.45,COLOR_BLUE,1)
 
-            cv2.putText(fv_s, f"Vehicles: {veh_count}",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
-            cv2.line(fv_s, (0, PEDESTRIAN_LANE_Y),
-                     (FRAME_W, PEDESTRIAN_LANE_Y), COLOR_YELLOW, 2)
+            cv2.putText(fv_s,"Vehicles: {}".format(veh_count),(8,20),cv2.FONT_HERSHEY_SIMPLEX,0.6,COLOR_WHITE,2)
+            cv2.line(fv_s,(0,PEDESTRIAN_LANE_Y),(FRAME_W,PEDESTRIAN_LANE_Y),COLOR_YELLOW,2)
 
-            # --- Traffic light color ---
+            # ---- TL color ----
             tl_color = detect_traffic_light_color(ft_s) if ok_tl else "unknown"
-            cv2.putText(ft_s, f"TL: {tl_color.upper()}",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
-            x, y, w, h = TRAFFIC_LIGHT_ROI
-            cv2.rectangle(ft_s, (x, y), (x + w, y + h), COLOR_WHITE, 2)
+            cv2.putText(ft_s,f"TL: {tl_color.upper()}",(8,20),cv2.FONT_HERSHEY_SIMPLEX,0.6,COLOR_WHITE,2)
+            x,y,w,h = TRAFFIC_LIGHT_ROI
+            cv2.rectangle(ft_s,(x,y),(x+w,y+h),COLOR_WHITE,2)
 
-            # Push frames to web UI (throttled JPEG encode)
+            # Publish frames throttled
             publish_frame_throttled("ped", fp_s)
             publish_frame_throttled("veh", fv_s)
             publish_frame_throttled("tl",  ft_s)
 
-            # Status → website (throttled)
+            # Status (throttled)
             now = time.time()
-            nearest_m = 0.0 if nearest_vehicle_distance_m == float('inf') else nearest_vehicle_distance_m
+            nearest_m = 0.0 if nearest_vehicle_distance_m==float('inf') else nearest_vehicle_distance_m
             if now - last_status_ts >= STATUS_MIN_PERIOD:
-                local_hour = time.localtime(now).tm_hour
-                flags = {"night": local_hour >= 21, "rush": local_hour == 7}
+                flags = {"night": time.localtime(now).tm_hour >= 21, "rush": time.localtime(now).tm_hour == 7}
                 extra = {"ambulance": False}
                 publish_status_from_loop(
                     now_ts=now,
@@ -711,69 +564,45 @@ def run_pipeline():
                 )
                 last_status_ts = now
 
-            # LED feedback (local)
+            # LED action
             action = "OFF"
             veh_close = (nearest_vehicle_distance_m < VEHICLE_CLOSE_THRESH_M) if ok_veh else False
             if tl_color == "red":
                 action = "STOP"
             elif tl_color == "green":
-                if ped_count > 0 and veh_close:
-                    action = "STOP"
-                elif ped_count > 0:
-                    action = "GO"
+                if ped_count > 0 and veh_close: action = "STOP"
+                elif ped_count > 0: action = "GO"
             elif tl_color == "yellow":
-                action = "STOP" if ped_count > 0 else "OFF"
+                action = "STOP" if ped_count>0 else "OFF"
             else:
-                if ped_count > 0 and (veh_close or veh_count > 0):
-                    action = "STOP"
-                elif ped_count > 0:
-                    action = "GO"
+                if ped_count>0 and (veh_close or veh_count>0): action="STOP"
+                elif ped_count>0: action="GO"
             show_led(action)
 
             # Overlay quick stats
-            cv2.putText(
-                fv_s,
-                f"Nearest dist: {nearest_m:.1f} m",
-                (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2
-            )
-            cv2.putText(fv_s, f"Avg speed: {avg_speed_mps:.1f} m/s",
-                        (8, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_WHITE, 2)
+            cv2.putText(fv_s,f"Nearest dist: {nearest_m:.1f} m",(8,44),cv2.FONT_HERSHEY_SIMPLEX,0.6,COLOR_WHITE,2)
+            cv2.putText(fv_s,f"Avg speed: {avg_speed_mps:.1f} m/s",(8,68),cv2.FONT_HERSHEY_SIMPLEX,0.6,COLOR_WHITE,2)
 
-            # Logging (time-based)
+            # DB logging (time-based)
             if now - last_log_ts >= LOG_EVERY_SEC:
-                log_event(DB_PATH, now, int(ped_count), int(veh_count),
-                          tl_color, float(nearest_m), float(avg_speed_mps), action)
+                log_event(DB_PATH, now, int(ped_count), int(veh_count), tl_color, float(nearest_m), float(avg_speed_mps), action)
                 last_log_ts = now
 
-            if PRINT_DEBUG and (frame_idx % 30 == 0):
-                print(f"[det] ped={ped_count} veh={veh_count} conf={YOLO_CONF} img={YOLO_IMG_SZ} class_filter={'off' if DISABLE_CLASS_FILTER else 'on'}")
-
             if SHOW_WINDOWS:
-                cv2.imshow("Pedestrians", fp_s)
-                cv2.imshow("Vehicles", fv_s)
-                cv2.imshow("Traffic Light", ft_s)
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:
-                    break
+                cv2.imshow("Ped", fp_s); cv2.imshow("Veh", fv_s); cv2.imshow("TL", ft_s)
+                if (cv2.waitKey(1)&0xFF)==27: break
 
             elapsed = time.time() - loop_start
-            if elapsed < FRAME_TIME:
-                time.sleep(FRAME_TIME - elapsed)
+            if elapsed < FRAME_TIME: time.sleep(FRAME_TIME - elapsed)
 
     finally:
-        for cam in (cam_ped, cam_veh, cam_tl):
-            try: cam.stop()
+        for c in (cam_ped, cam_veh, cam_tl):
+            try: c.stop()
             except Exception: pass
-        try: ped_frames.put(None)
+        try: ped_frames.put(None); veh_frames.put(None)
         except Exception: pass
-        try: veh_frames.put(None)
-        except Exception: pass
-        if SHOW_WINDOWS:
-            cv2.destroyAllWindows()
+        if SHOW_WINDOWS: cv2.destroyAllWindows()
 
-# --------------------- ENTRYPOINT ---------------------
 if __name__ == "__main__":
-    # Run processing on a background thread
     threading.Thread(target=run_pipeline, daemon=True).start()
-    # Run the web server in the MAIN thread (prevents starvation)
     start_http_server(host="0.0.0.0", port=5000)
